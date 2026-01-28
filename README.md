@@ -31,7 +31,7 @@ A powerful, feature‑rich **Telegram Music Bot** for voice chats with support f
 
 ### ☁️ Heroku Deployment
 
-[**![Deploy on Heroku**](https://img.shields.io/badge/Deploy%20On%20Heroku-purple?style=for-the-badge\&logo=heroku)](https://dashboard.heroku.com/new?template=https://github.com/lll-DEADLY-VENOM-lll/VIP-MUSIC)
+[**![Deploy on Heroku**](https://img.shields.io/badge/Deploy%20On%20Heroku-purple?style=for-the-badge\&logo=heroku)](https://dashboard.heroku.com/new?template=https://github.com/KIRU-OP/VIP-MUSIC)
 
 ---
 
@@ -39,7 +39,7 @@ A powerful, feature‑rich **Telegram Music Bot** for voice chats with support f
 
 ```bash
 # Clone the repository
-git clone https://github.com/lll-DEADLY-VENOM-lll/VIP-MUSIC && cd VIP-MUSIC
+git clone https://github.com/KIRU-OP/VIP-MUSIC && cd VIP-MUSIC
 
 # Run setup script
 bash setup
@@ -87,7 +87,7 @@ bash start
 * `HEROKU_API_KEY` – Heroku API key
 * `HEROKU_APP_NAME` – Heroku app name
 
-📘 [**Full variable list**](https://github.com/lll-DEADLY-VENOM-lll/VIP-MUSIC/edit/Test/README.md)
+📘 [**Full variable list**](https://github.com/KIRU-OP/VIP-MUSIC/edit/Test/README.md)
 
 ---
 
@@ -104,31 +104,6 @@ To ensure **stable and official YouTube search & metadata fetching**, this bot s
 
 ---
 
-### 🛠 How to Get YouTube API Key (Step‑by‑Step)
-
-1. Go to [**Google Cloud Console**](https://console.cloud.google.com/)
-
-2. Create a **New Project**
-
-3. Enable **YouTube Data API v3**
-
-   * APIs & Services → Library → Search for *YouTube Data API v3* → Enable
-
-4. Create API credentials
-
-   * APIs & Services → Credentials → Create Credentials → API Key
-
-5. Copy the generated **API Key**
-
----
-
-### 🧩 Add YouTube API to Bot Config
-
-Add this variable to your `.env` file:
-
-```env
-YOUTUBE_API_KEY=your_google_cloud_youtube_api_key
-```
 
 ⚠️ Make sure the API is **enabled** for your project, otherwise YouTube search will not work.
 
@@ -143,7 +118,7 @@ YOUTUBE_API_KEY=your_google_cloud_youtube_api_key
 
 ## 📃 License
 
-This project is licensed under the [**MIT License**](https://github.com/lll-DEADLY-VENOM-lll/VIP-MUSIC/edit/Test/README.md)
+This project is licensed under the [**MIT License**](https://github.com/KIRU-OP/VIP-MUSIC/edit/Test/README.md)
 
 ---
 
