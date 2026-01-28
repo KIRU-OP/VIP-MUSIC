@@ -91,20 +91,6 @@ bash start
 
 ---
 
-## 🔑 Google Cloud – YouTube Data API v3 Integration
-
-To ensure **stable and official YouTube search & metadata fetching**, this bot supports **Google Cloud YouTube Data API v3**.
-
-### ✅ Why Use YouTube Data API v3?
-
-* 🚀 Official & reliable YouTube search
-* ❌ No YouTube cookies required
-* 🔐 Avoids frequent `yt-dlp` sign‑in / bot check issues
-* 📈 Better metadata (title, duration, thumbnails)
-
----
-
-
 ⚠️ Make sure the API is **enabled** for your project, otherwise YouTube search will not work.
 
 ---
