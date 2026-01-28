@@ -28,14 +28,6 @@ BOT_TOKEN = getenv("BOT_TOKEN")
 
 MONGO_DB_URI = getenv("MONGO_DB_URI", "mongodb+srv://vishalpandeynkp:Bal6Y6FZeQeoAoqV@cluster0.dzgwt.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 
-# -----------------------------------------------------------------
-# YOUTUBE API KEYS (MULTI-KEY SUPPORT)
-# यहाँ अपनी सभी Keys को कोमा (,) लगाकर डालें। 
-# उदाहरण: "key1, key2, key3"
-# -----------------------------------------------------------------
-API_KEY = getenv("API_KEY", "AIzaSyAurKSn9YNaY34MBogPzcR1YJ-bvmInm7U, AIzaSyCApVjCS5KA8xIVhqPTq0IdNriVv95Tnq4, AIzaSyDlTU81AhslOne7AjKrFe_BLPBuTg0PbW0,")
-# -----------------------------------------------------------------
-
 CLEANMODE_DELETE_MINS = int(
     getenv("CLEANMODE_MINS", "18000")
 )  # Remember to give value in Seconds
@@ -58,7 +50,7 @@ EXTRA_PLUGINS = getenv(
 
 EXTRA_PLUGINS_REPO = getenv(
     "EXTRA_PLUGINS_REPO",
-    "https://github.com/lll-DEADLY-VENOM-lll/Extra-Plugin",
+    "https://github.com/KIRU-OP/Extra-Plugin",
 )
 # Fill here the external plugins repo where plugins that you want to load
 
@@ -154,7 +146,7 @@ TELEGRAM_DOWNLOAD_EDIT_SLEEP = int(getenv("TELEGRAM_EDIT_SLEEP", "5"))
 
 
 # Your Github Repo.. Will be shown on /start Command
-GITHUB_REPO = getenv("GITHUB_REPO", "https://github.com/lll-DEADLY-VENOM-lll/VIP-MUSIC")
+GITHUB_REPO = getenv("GITHUB_REPO", "https://github.com/KIRU-OP/VIP-MUSIC")
 
 
 # Spotify Client.. Get it from https://developer.spotify.com/dashboard
