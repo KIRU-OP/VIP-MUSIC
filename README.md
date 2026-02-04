@@ -98,7 +98,7 @@ bash start
 ## 🤝 Support & Community
 
 * 🔔 [**Updates Channel**](https://t.me/about_deadly_venom)
-* 🆘 [**Support Group**](https://t.me/TNOBITA_SUPPORT)
+* 🆘 [**Support Group**](https://t.me/NOBITA_SUPPORT)
 
 ---
 
