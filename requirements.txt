@@ -38,4 +38,5 @@ PyGithub
 gunicorn==20.1.0
 yt-dlp
 youtube-search-python
+youtube-search
 https://github.com/KurimuzonAkuma/pyrogram/archive/v2.1.23.zip
