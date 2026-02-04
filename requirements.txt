@@ -11,7 +11,7 @@ ffmpeg-python
 gitpython
 hachoir
 heroku3
-#httpx[http2]
+httpx[http2]
 httpx==0.27.2
 lyricsgenius
 motor==2.5.0
@@ -34,7 +34,7 @@ tgcrypto
 urllib3
 uvloop
 flask
+PyGithub
 gunicorn==20.1.0
 yt-dlp
 https://github.com/KurimuzonAkuma/pyrogram/archive/v2.1.23.zip
-git+https://github.com/lll-DEADLY-VENOM-lll/TheApi@main
