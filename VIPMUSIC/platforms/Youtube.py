@@ -18,7 +18,6 @@ from VIPMUSIC.utils.formatters import time_to_seconds
 # Initialize Logger
 logger = logging.getLogger(__name__)
 
-# Track class to fix NameError
 class Track:
     def __init__(self, id, channel_name, duration, duration_sec, title, thumbnail, url, video, message_id=None, view_count=None, user=None):
         self.id = id
@@ -33,7 +32,7 @@ class Track:
         self.view_count = view_count
         self.user = user
 
-class YouTubeAPI:  # <--- Renamed from YouTube to YouTubeAPI
+class YouTubeAPI:
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
         self.cookie_dir = "VIPMUSIC/cookies"
@@ -49,6 +48,35 @@ class YouTubeAPI:  # <--- Renamed from YouTube to YouTubeAPI
             r"(youtube\.com/(watch\?v=|shorts/|playlist\?list=)|youtu\.be/)"
             r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)([&?][^\s]*)?"
         )
+
+    # --- ADDED THE MISSING URL METHOD ---
+    async def url(self, message: Message) -> str | bool:
+        """Extracts a YouTube URL from a message or a replied-to message."""
+        messages = [message]
+        if message.reply_to_message:
+            messages.append(message.reply_to_message)
+
+        for msg in messages:
+            text = msg.text or msg.caption
+            if not text:
+                continue
+
+            # Check if text is a direct URL match
+            if re.match(self.regex, text):
+                return text
+
+            # Check message entities for links
+            entities = msg.entities or msg.caption_entities
+            if entities:
+                for entity in entities:
+                    if entity.type == MessageEntityType.URL:
+                        url = text[entity.offset : entity.offset + entity.length]
+                        if re.match(self.regex, url):
+                            return url
+                    elif entity.type == MessageEntityType.TEXT_LINK:
+                        if re.match(self.regex, entity.url):
+                            return entity.url
+        return False
 
     def get_cookies(self):
         if not self.checked:
@@ -91,12 +119,8 @@ class YouTubeAPI:  # <--- Renamed from YouTube to YouTubeAPI
     async def playlist(self, limit: int, user: str, url: str, video: bool) -> List[Track]:
         tracks = []
         try:
-            # Using youtubesearchpython Playlist
-            plist = Playlist(url)
-            while plist.hasMoreVideos and len(tracks) < limit:
-                await plist.getNextVideos()
-            
-            for data in plist.videos[:limit]:
+            plist = await Playlist.get(url)
+            for data in plist.get("videos", [])[:limit]:
                 track = Track(
                     id=data.get("id"),
                     channel_name=data.get("channel", {}).get("name", ""),
