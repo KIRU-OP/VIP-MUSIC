@@ -1,18 +1,37 @@
+from __future__ import annotations # Allows using Track in type hints before definition
 import asyncio
-import glob
 import os
 import random
 import re
-from typing import Union
+import logging
+from typing import Union, List, Optional
 
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
-from youtubesearchpython.__future__ import VideosSearch
-from yt_dlp import YoutubeDL
+from youtubesearchpython.__future__ import VideosSearch, Playlist # Added Playlist
+import yt_dlp # Changed import to handle usage below
 
 import config
 from VIPMUSIC.utils.database import is_on_off
 from VIPMUSIC.utils.formatters import time_to_seconds
+
+# Initialize Logger
+logger = logging.getLogger(__name__)
+
+# Define the Track class that was missing
+class Track:
+    def __init__(self, id, channel_name, duration, duration_sec, title, thumbnail, url, video, message_id=None, view_count=None, user=None):
+        self.id = id
+        self.channel_name = channel_name
+        self.duration = duration
+        self.duration_sec = duration_sec
+        self.title = title
+        self.thumbnail = thumbnail
+        self.url = url
+        self.video = video
+        self.message_id = message_id
+        self.view_count = view_count
+        self.user = user
 
 class YouTube:
     def __init__(self):
@@ -22,11 +41,9 @@ class YouTube:
         self.cookies = []
         self.checked = False
         
-        # Ensure required directories exist
         os.makedirs(self.cookie_dir, exist_ok=True)
         os.makedirs(self.download_dir, exist_ok=True)
 
-        # Robust YouTube URL Validation
         self.regex = re.compile(
             r"(https?://)?(www\.|m\.|music\.)?"
             r"(youtube\.com/(watch\?v=|shorts/|playlist\?list=)|youtu\.be/)"
@@ -34,7 +51,6 @@ class YouTube:
         )
 
     def get_cookies(self):
-        """Loads random cookie file from the local cookie directory if available."""
         if not self.checked:
             if os.path.exists(self.cookie_dir):
                 for file in os.listdir(self.cookie_dir):
@@ -47,11 +63,9 @@ class YouTube:
         return random.choice(self.cookies)
 
     def valid(self, url: str) -> bool:
-        """Validates if a URL is a proper YouTube link."""
         return bool(re.match(self.regex, url))
 
-    async def search(self, query: str, m_id: int, video: bool = False) -> Track | None:
-        """Searches for a single track on YouTube."""
+    async def search(self, query: str, m_id: int, video: bool = False) -> Optional[Track]:
         try:
             _search = VideosSearch(query, limit=1, with_live=False)
             results = await _search.next()
@@ -62,7 +76,7 @@ class YouTube:
                     id=data.get("id"),
                     channel_name=data.get("channel", {}).get("name"),
                     duration=data.get("duration"),
-                    duration_sec=utils.to_seconds(data.get("duration")),
+                    duration_sec=time_to_seconds(data.get("duration")), # Changed from utils.to_seconds
                     message_id=m_id,
                     title=data.get("title")[:50], 
                     thumbnail=data.get("thumbnails", [{}])[-1].get("url").split("?")[0],
@@ -74,17 +88,17 @@ class YouTube:
             logger.error(f"Search Error: {e}")
         return None
 
-    async def playlist(self, limit: int, user: str, url: str, video: bool) -> list[Track]:
-        """Fetches tracks from a YouTube playlist."""
+    async def playlist(self, limit: int, user: str, url: str, video: bool) -> List[Track]:
         tracks = []
         try:
+            # Note: youtubesearchpython's Playlist logic
             plist = await Playlist.get(url)
             for data in plist.get("videos", [])[:limit]:
                 track = Track(
                     id=data.get("id"),
                     channel_name=data.get("channel", {}).get("name", ""),
                     duration=data.get("duration"),
-                    duration_sec=utils.to_seconds(data.get("duration")),
+                    duration_sec=time_to_seconds(data.get("duration")), # Changed from utils.to_seconds
                     title=data.get("title")[:50],
                     thumbnail=data.get("thumbnails")[-1].get("url").split("?")[0],
                     url=data.get("link").split("&list=")[0],
@@ -97,19 +111,16 @@ class YouTube:
             logger.error(f"Playlist Error: {e}")
         return tracks
 
-    async def download(self, video_id: str, video: bool = False) -> str | None:
-        """Downloads the video/audio using yt-dlp."""
+    async def download(self, video_id: str, video: bool = False) -> Optional[str]:
         url = self.base + video_id
         ext = "mp4" if video else "webm"
         filename = os.path.join(self.download_dir, f"{video_id}.{ext}")
 
-        # Return file if already downloaded
         if os.path.exists(filename):
             return filename
 
         cookie = self.get_cookies()
         
-        # Standard Professional yt-dlp Options
         ydl_opts = {
             "outtmpl": os.path.join(self.download_dir, "%(id)s.%(ext)s"),
             "quiet": True,
@@ -132,6 +143,7 @@ class YouTube:
 
         def _download():
             try:
+                # Fixed the usage of yt_dlp
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
                 return filename
@@ -139,5 +151,4 @@ class YouTube:
                 logger.error(f"Download failed for {video_id}: {ex}")
                 return None
 
-        # Running synchronous download in a thread to keep the loop non-blocking
         return await asyncio.to_thread(_download)
