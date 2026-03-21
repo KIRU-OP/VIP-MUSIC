@@ -32,7 +32,7 @@ class Track:
         self.view_count = view_count
         self.user = user
 
-class YouTubeAPI:
+class YouTube:
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
         self.cookie_dir = "VIPMUSIC/cookies"
