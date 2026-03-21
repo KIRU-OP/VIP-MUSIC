@@ -49,9 +49,7 @@ class YouTubeAPI:
             r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)([&?][^\s]*)?"
         )
 
-    # --- ADDED THE MISSING URL METHOD ---
     async def url(self, message: Message) -> str | bool:
-        """Extracts a YouTube URL from a message or a replied-to message."""
         messages = [message]
         if message.reply_to_message:
             messages.append(message.reply_to_message)
@@ -61,11 +59,9 @@ class YouTubeAPI:
             if not text:
                 continue
 
-            # Check if text is a direct URL match
             if re.match(self.regex, text):
                 return text
 
-            # Check message entities for links
             entities = msg.entities or msg.caption_entities
             if entities:
                 for entity in entities:
@@ -85,57 +81,65 @@ class YouTubeAPI:
                     if file.endswith(".txt"):
                         self.cookies.append(os.path.join(self.cookie_dir, file))
             self.checked = True
-            
-        if not self.cookies:
-            return None
-        return random.choice(self.cookies)
+        return random.choice(self.cookies) if self.cookies else None
 
-    def valid(self, url: str) -> bool:
-        return bool(re.match(self.regex, url))
-
-    async def search(self, query: str, m_id: int, video: bool = False) -> Optional[Track]:
+    async def search(self, query: str, m_id: int = None, video: bool = False) -> Optional[Track]:
         try:
-            _search = VideosSearch(query, limit=1, with_live=False)
-            results = await _search.next()
+            # Check if query is a direct link, if so, we just use it
+            if re.match(self.regex, query):
+                query = query.split("&")[0] # Clean URL
+
+            search = VideosSearch(query, limit=1)
+            response = (await search.next())
+            if not response or not response.get("result"):
+                return None
             
-            if results and results.get("result"):
-                data = results["result"][0]
-                return Track(
-                    id=data.get("id"),
-                    channel_name=data.get("channel", {}).get("name"),
-                    duration=data.get("duration"),
-                    duration_sec=time_to_seconds(data.get("duration")), 
-                    message_id=m_id,
-                    title=data.get("title")[:50], 
-                    thumbnail=data.get("thumbnails", [{}])[-1].get("url").split("?")[0],
-                    url=data.get("link"),
-                    view_count=data.get("viewCount", {}).get("short"),
-                    video=video,
-                )
+            result = response["result"][0]
+            
+            # Handle Live Streams or missing durations
+            duration = result.get("duration")
+            if not duration:
+                duration = "00:00"
+            
+            return Track(
+                id=result.get("id"),
+                channel_name=result.get("channel", {}).get("name", "Unknown"),
+                duration=duration,
+                duration_sec=time_to_seconds(duration),
+                message_id=m_id,
+                title=result.get("title", "Unknown Title")[:50],
+                thumbnail=result.get("thumbnails", [{}])[-1].get("url").split("?")[0],
+                url=result.get("link"),
+                view_count=result.get("viewCount", {}).get("short", "0"),
+                video=video,
+            )
         except Exception as e:
-            logger.error(f"Search Error: {e}")
-        return None
+            logger.error(f"YouTube Search Error: {e}")
+            return None
 
     async def playlist(self, limit: int, user: str, url: str, video: bool) -> List[Track]:
         tracks = []
         try:
-            plist = await Playlist.get(url)
-            for data in plist.get("videos", [])[:limit]:
+            # Correct Playlist handling for youtubesearchpython-async
+            playlist = await Playlist.get(url)
+            for data in playlist.get("videos", [])[:limit]:
+                duration = data.get("duration") or "00:00"
+                
                 track = Track(
                     id=data.get("id"),
-                    channel_name=data.get("channel", {}).get("name", ""),
-                    duration=data.get("duration"),
-                    duration_sec=time_to_seconds(data.get("duration")),
+                    channel_name=data.get("channel", {}).get("name", "Unknown"),
+                    duration=duration,
+                    duration_sec=time_to_seconds(duration),
                     title=data.get("title")[:50],
                     thumbnail=data.get("thumbnails")[-1].get("url").split("?")[0],
                     url=data.get("link").split("&list=")[0],
                     user=user,
-                    view_count="",
+                    view_count="0",
                     video=video,
                 )
                 tracks.append(track)
         except Exception as e:
-            logger.error(f"Playlist Error: {e}")
+            logger.error(f"YouTube Playlist Error: {e}")
         return tracks
 
     async def download(self, video_id: str, video: bool = False) -> Optional[str]:
@@ -147,7 +151,6 @@ class YouTubeAPI:
             return filename
 
         cookie = self.get_cookies()
-        
         ydl_opts = {
             "outtmpl": os.path.join(self.download_dir, "%(id)s.%(ext)s"),
             "quiet": True,
@@ -174,7 +177,7 @@ class YouTubeAPI:
                     ydl.download([url])
                 return filename
             except Exception as ex:
-                logger.error(f"Download failed for {video_id}: {ex}")
+                logger.error(f"Download Error: {ex}")
                 return None
 
         return await asyncio.to_thread(_download)
