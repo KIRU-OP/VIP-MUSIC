@@ -8,10 +8,10 @@ from yt_dlp import YoutubeDL
 
 from VIPMUSIC import app
 # Humne aapki naya YouTubeAPI class import kar liya
-from VIPMUSIC.platforms.Youtube import YouTube
+from VIPMUSIC.platforms.Youtube import YouTubeAPI
 
 # Initialize YouTube API
-YouTube = YouTube()
+YouTube = YouTubeAPI()
 
 # User trackers
 user_last_CallbackQuery_time = {}
