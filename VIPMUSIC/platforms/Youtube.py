@@ -1,13 +1,18 @@
-import os
-import re
-import yt_dlp
-import random
 import asyncio
-from pathlib import Path
+import glob
+import os
+import random
+import re
+from typing import Union
 
-from py_yt import Playlist, VideosSearch
-from VIPMUSIC import logger
-from VIPMUSIC.helpers import Track, utils
+from pyrogram.enums import MessageEntityType
+from pyrogram.types import Message
+from youtubesearchpython.__future__ import VideosSearch
+from yt_dlp import YoutubeDL
+
+import config
+from VIPMUSIC.utils.database import is_on_off
+from VIPMUSIC.utils.formatters import time_to_seconds
 
 class YouTube:
     def __init__(self):
