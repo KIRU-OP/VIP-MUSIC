@@ -1,4 +1,4 @@
-from __future__ import annotations # Allows using Track in type hints before definition
+from __future__ import annotations
 import asyncio
 import os
 import random
@@ -8,8 +8,8 @@ from typing import Union, List, Optional
 
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
-from youtubesearchpython.__future__ import VideosSearch, Playlist # Added Playlist
-import yt_dlp # Changed import to handle usage below
+from youtubesearchpython.__future__ import VideosSearch, Playlist
+import yt_dlp
 
 import config
 from VIPMUSIC.utils.database import is_on_off
@@ -18,7 +18,7 @@ from VIPMUSIC.utils.formatters import time_to_seconds
 # Initialize Logger
 logger = logging.getLogger(__name__)
 
-# Define the Track class that was missing
+# Track class to fix NameError
 class Track:
     def __init__(self, id, channel_name, duration, duration_sec, title, thumbnail, url, video, message_id=None, view_count=None, user=None):
         self.id = id
@@ -33,7 +33,7 @@ class Track:
         self.view_count = view_count
         self.user = user
 
-class YouTube:
+class YouTubeAPI:  # <--- Renamed from YouTube to YouTubeAPI
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
         self.cookie_dir = "VIPMUSIC/cookies"
@@ -76,7 +76,7 @@ class YouTube:
                     id=data.get("id"),
                     channel_name=data.get("channel", {}).get("name"),
                     duration=data.get("duration"),
-                    duration_sec=time_to_seconds(data.get("duration")), # Changed from utils.to_seconds
+                    duration_sec=time_to_seconds(data.get("duration")), 
                     message_id=m_id,
                     title=data.get("title")[:50], 
                     thumbnail=data.get("thumbnails", [{}])[-1].get("url").split("?")[0],
@@ -91,14 +91,17 @@ class YouTube:
     async def playlist(self, limit: int, user: str, url: str, video: bool) -> List[Track]:
         tracks = []
         try:
-            # Note: youtubesearchpython's Playlist logic
-            plist = await Playlist.get(url)
-            for data in plist.get("videos", [])[:limit]:
+            # Using youtubesearchpython Playlist
+            plist = Playlist(url)
+            while plist.hasMoreVideos and len(tracks) < limit:
+                await plist.getNextVideos()
+            
+            for data in plist.videos[:limit]:
                 track = Track(
                     id=data.get("id"),
                     channel_name=data.get("channel", {}).get("name", ""),
                     duration=data.get("duration"),
-                    duration_sec=time_to_seconds(data.get("duration")), # Changed from utils.to_seconds
+                    duration_sec=time_to_seconds(data.get("duration")),
                     title=data.get("title")[:50],
                     thumbnail=data.get("thumbnails")[-1].get("url").split("?")[0],
                     url=data.get("link").split("&list=")[0],
@@ -143,7 +146,6 @@ class YouTube:
 
         def _download():
             try:
-                # Fixed the usage of yt_dlp
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
                 return filename
