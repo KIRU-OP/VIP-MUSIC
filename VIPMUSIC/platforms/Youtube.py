@@ -7,9 +7,6 @@ import aiohttp
 import yt_dlp
 from pyrogram.types import Message
 
-# REMOVED: youtubesearchpython (deprecated)
-# ADDED: Direct yt-dlp search functionality
-
 import config
 from VIPMUSIC.utils.database import is_on_off
 from VIPMUSIC.utils.formatters import time_to_seconds
@@ -37,6 +34,24 @@ class YouTubeAPI:
         self.status = "https://www.youtube.com/oembed?url="
         self.listbase = "https://youtube.com/playlist?list="
         self.reg = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+    def _parse_duration(self, duration):
+        """Helper to convert various yt-dlp duration formats to MM:SS or HH:MM:SS"""
+        if duration is None:
+            return "0:00"
+        
+        try:
+            # If duration is a string like "197.0" or an int 197
+            seconds = int(float(duration))
+            m, s = divmod(seconds, 60)
+            h, m = divmod(m, 60)
+            if h > 0:
+                return f"{h}:{m:02d}:{s:02d}"
+            else:
+                return f"{m}:{s:02d}"
+        except (ValueError, TypeError):
+            # If it's already a string like "03:17", return as is
+            return str(duration)
 
     async def exists(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
@@ -70,18 +85,13 @@ class YouTubeAPI:
             return None
         return text[offset : offset + length]
 
-    # ========== FIXED: Replaced youtubesearchpython with yt-dlp search ==========
-    
     async def _search_yt_dlp(self, query: str, limit: int = 1):
-        """Search YouTube using yt-dlp instead of youtubesearchpython"""
         search_query = f"ytsearch{limit}:{query}"
-        
         ydl_opts = {
             "quiet": True,
             "extract_flat": True,
             "force_generic_extractor": False,
         }
-        
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 results = ydl.extract_info(search_query, download=False)
@@ -98,56 +108,40 @@ class YouTubeAPI:
         if "&" in link:
             link = link.split("&")[0]
         
-        # FIXED: Use yt-dlp search instead of VideosSearch
         results = await self._search_yt_dlp(link, limit=1)
-        
         if not results:
             return None, None, 0, None, None
             
         result = results[0]
         title = result.get("title", "Unknown")
-        duration_str = result.get("duration", "0:00")
+        
+        # FIXED: Ensure duration is properly formatted before returning
+        raw_duration = result.get("duration")
+        duration_min = self._parse_duration(raw_duration)
+        duration_sec = int(time_to_seconds(duration_min))
+        
         thumbnail = result.get("thumbnail", "")
         vidid = result.get("id", "")
-        
-        # Parse duration
-        if str(duration_str) == "None" or not duration_str:
-            duration_sec = 0
-            duration_min = "0:00"
-        else:
-            duration_min = duration_str
-            duration_sec = int(time_to_seconds(duration_str))
             
         return title, duration_min, duration_sec, thumbnail, vidid
 
     async def title(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-            
         results = await self._search_yt_dlp(link, limit=1)
-        if results:
-            return results[0].get("title", "Unknown")
-        return "Unknown"
+        return results[0].get("title", "Unknown") if results else "Unknown"
 
     async def duration(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-            
         results = await self._search_yt_dlp(link, limit=1)
         if results:
-            return results[0].get("duration", "0:00")
+            return self._parse_duration(results[0].get("duration"))
         return "0:00"
 
     async def thumbnail(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-            
         results = await self._search_yt_dlp(link, limit=1)
         if results:
             thumb = results[0].get("thumbnail", "")
@@ -160,11 +154,10 @@ class YouTubeAPI:
         if "&" in link:
             link = link.split("&")[0]
             
-        # FIXED: Updated yt-dlp command for 2025 version
         proc = await asyncio.create_subprocess_exec(
             "yt-dlp",
-            "--no-check-certificates",  # ADDED
-            "--no-warnings",            # ADDED
+            "--no-check-certificates",
+            "--no-warnings",
             "-g",
             "-f",
             "best[height<=?720][width<=?1280]",
@@ -181,19 +174,11 @@ class YouTubeAPI:
     async def playlist(self, link, limit, user_id, videoid: Union[bool, str] = None):
         if videoid:
             link = self.listbase + link
-        if "&" in link:
-            link = link.split("&")[0]
-            
-        # FIXED: Updated shell command
         playlist = await shell_cmd(
             f'yt-dlp --no-check-certificates --no-warnings -i --get-id --flat-playlist --playlist-end {limit} --skip-download "{link}"'
         )
-        
         try:
-            result = playlist.split("\n")
-            for key in result:
-                if key == "":
-                    result.remove(key)
+            result = [k for k in playlist.split("\n") if k]
         except:
             result = []
         return result
@@ -201,91 +186,36 @@ class YouTubeAPI:
     async def track(self, link: str, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-            
         results = await self._search_yt_dlp(link, limit=1)
-        
         if not results:
             return {}, None
             
         result = results[0]
-        title = result.get("title", "Unknown")
-        duration_min = result.get("duration", "0:00")
         vidid = result.get("id", "")
-        yturl = f"https://www.youtube.com/watch?v={vidid}"
-        thumbnail = result.get("thumbnail", "")
+        # FIXED: Formatting duration here
+        duration_min = self._parse_duration(result.get("duration"))
         
         track_details = {
-            "title": title,
-            "link": yturl,
+            "title": result.get("title", "Unknown"),
+            "link": f"https://www.youtube.com/watch?v={vidid}",
             "vidid": vidid,
             "duration_min": duration_min,
-            "thumb": thumbnail.split("?")[0] if "?" in str(thumbnail) else thumbnail,
+            "thumb": result.get("thumbnail", ""),
         }
         return track_details, vidid
-
-    async def formats(self, link: str, videoid: Union[bool, str] = None):
-        if videoid:
-            link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-            
-        ytdl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "no_check_certificates": True,  # ADDED
-        }
-        
-        ydl = yt_dlp.YoutubeDL(ytdl_opts)
-        with ydl:
-            formats_available = []
-            r = ydl.extract_info(link, download=False)
-            for format in r["formats"]:
-                try:
-                    str(format["format"])
-                except:
-                    continue
-                if not "dash" in str(format["format"]).lower():
-                    try:
-                        format["format"]
-                        format["filesize"]
-                        format["format_id"]
-                        format["ext"]
-                        format["format_note"]
-                    except:
-                        continue
-                    formats_available.append(
-                        {
-                            "format": format["format"],
-                            "filesize": format["filesize"],
-                            "format_id": format["format_id"],
-                            "ext": format["ext"],
-                            "format_note": format["format_note"],
-                            "yturl": link,
-                        }
-                    )
-        return formats_available, link
 
     async def slider(self, link: str, query_type: int, videoid: Union[bool, str] = None):
         if videoid:
             link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-            
-        # FIXED: Use yt-dlp for slider/search results
         results = await self._search_yt_dlp(link, limit=10)
-        
         if not results or query_type >= len(results):
             return None, None, None, None
             
         result = results[query_type]
-        title = result.get("title", "Unknown")
-        duration_min = result.get("duration", "0:00")
-        vidid = result.get("id", "")
+        duration_min = self._parse_duration(result.get("duration"))
         thumbnail = result.get("thumbnail", "")
         
-        return title, duration_min, thumbnail.split("?")[0] if "?" in str(thumbnail) else thumbnail, vidid
+        return result.get("title", "Unknown"), duration_min, thumbnail, result.get("id", "")
 
     async def download(
         self,
@@ -302,130 +232,45 @@ class YouTubeAPI:
             link = self.base + link
         loop = asyncio.get_running_loop()
 
+        common_opts = {
+            "geo_bypass": True,
+            "nocheckcertificate": True,
+            "quiet": True,
+            "no_warnings": True,
+            "no_check_certificates": True,
+            "extractor_args": {"youtube": {"player_client": ["web"]}}
+        }
+
         def audio_dl():
-            ydl_optssx = {
-                "format": "bestaudio/best",
-                "outtmpl": "downloads/%(id)s.%(ext)s",
-                "geo_bypass": True,
-                "nocheckcertificate": True,
-                "quiet": True,
-                "no_warnings": True,
-                # ADDED: 2025 compatibility options
-                "no_check_certificates": True,
-                "prefer_insecure": True,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["web"],  # FIXED: Use web client
-                    }
-                }
-            }
-            x = yt_dlp.YoutubeDL(ydl_optssx)
-            info = x.extract_info(link, False)
-            xyz = os.path.join("downloads", f"{info['id']}.{info['ext']}")
-            if os.path.exists(xyz):
-                return xyz
-            x.download([link])
-            return xyz
+            opts = {**common_opts, "format": "bestaudio/best", "outtmpl": "downloads/%(id)s.%(ext)s"}
+            with yt_dlp.YoutubeDL(opts) as x:
+                info = x.extract_info(link, False)
+                fpath = os.path.join("downloads", f"{info['id']}.{info['ext']}")
+                if os.path.exists(fpath): return fpath
+                x.download([link])
+                return fpath
 
         def video_dl():
-            ydl_optssx = {
-                "format": "(bestvideo[height<=?720][width<=?1280][ext=mp4])+(bestaudio[ext=m4a])",
-                "outtmpl": "downloads/%(id)s.%(ext)s",
-                "geo_bypass": True,
-                "nocheckcertificate": True,
-                "quiet": True,
-                "no_warnings": True,
-                # ADDED: 2025 compatibility
-                "no_check_certificates": True,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["web"],
-                    }
-                }
-            }
-            x = yt_dlp.YoutubeDL(ydl_optssx)
-            info = x.extract_info(link, False)
-            xyz = os.path.join("downloads", f"{info['id']}.{info['ext']}")
-            if os.path.exists(xyz):
-                return xyz
-            x.download([link])
-            return xyz
-
-        def song_video_dl():
-            formats = f"{format_id}+140"
-            fpath = f"downloads/{title}"
-            ydl_optssx = {
-                "format": formats,
-                "outtmpl": fpath,
-                "geo_bypass": True,
-                "nocheckcertificate": True,
-                "quiet": True,
-                "no_warnings": True,
-                "prefer_ffmpeg": True,
-                "merge_output_format": "mp4",
-                # ADDED
-                "no_check_certificates": True,
-            }
-            x = yt_dlp.YoutubeDL(ydl_optssx)
-            x.download([link])
-
-        def song_audio_dl():
-            fpath = f"downloads/{title}.%(ext)s"
-            ydl_optssx = {
-                "format": format_id,
-                "outtmpl": fpath,
-                "geo_bypass": True,
-                "nocheckcertificate": True,
-                "quiet": True,
-                "no_warnings": True,
-                "prefer_ffmpeg": True,
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }
-                ],
-                # ADDED
-                "no_check_certificates": True,
-            }
-            x = yt_dlp.YoutubeDL(ydl_optssx)
-            x.download([link])
+            opts = {**common_opts, "format": "(bestvideo[height<=?720][width<=?1280][ext=mp4])+(bestaudio[ext=m4a])", "outtmpl": "downloads/%(id)s.%(ext)s"}
+            with yt_dlp.YoutubeDL(opts) as x:
+                info = x.extract_info(link, False)
+                fpath = os.path.join("downloads", f"{info['id']}.{info['ext']}")
+                if os.path.exists(fpath): return fpath
+                x.download([link])
+                return fpath
 
         if songvideo:
-            await loop.run_in_executor(None, song_video_dl)
-            fpath = f"downloads/{title}.mp4"
-            return fpath
+            await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL({**common_opts, "format": f"{format_id}+140", "outtmpl": f"downloads/{title}", "merge_output_format": "mp4"}).download([link]))
+            return f"downloads/{title}.mp4"
         elif songaudio:
-            await loop.run_in_executor(None, song_audio_dl)
-            fpath = f"downloads/{title}.mp3"
-            return fpath
+            await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL({**common_opts, "format": format_id, "outtmpl": f"downloads/{title}.%(ext)s", "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]}).download([link]))
+            return f"downloads/{title}.mp3"
         elif video:
             if await is_on_off(config.YTDOWNLOADER):
-                direct = True
-                downloaded_file = await loop.run_in_executor(None, video_dl)
+                return await loop.run_in_executor(None, video_dl), True
             else:
-                proc = await asyncio.create_subprocess_exec(
-                    "yt-dlp",
-                    "--no-check-certificates",  # ADDED
-                    "--no-warnings",
-                    "-g",
-                    "-f",
-                    "best[height<=?720][width<=?1280]",
-                    f"{link}",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await proc.communicate()
-                if stdout:
-                    downloaded_file = stdout.decode().split("\n")[0]
-                    direct = None
-                else:
-                    return None, None
+                proc = await asyncio.create_subprocess_exec("yt-dlp", "--no-check-certificates", "-g", "-f", "best[height<=?720]", link, stdout=asyncio.subprocess.PIPE)
+                stdout, _ = await proc.communicate()
+                return (stdout.decode().split("\n")[0], None) if stdout else (None, None)
         else:
-            direct = True
-            downloaded_file = await loop.run_in_executor(None, audio_dl)
-            
-        return downloaded_file, direct
-
-
+            return await loop.run_in_executor(None, audio_dl), True
