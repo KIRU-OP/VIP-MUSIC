@@ -26,7 +26,7 @@ MONGO_DB_URI = getenv("MONGO_DB_URI", None)
 EXTRA_PLUGINS = getenv("EXTRA_PLUGINS", "True")
 
 # External plugins repository link
-EXTRA_PLUGINS_REPO = getenv("EXTRA_PLUGINS_REPO", "https://github.com/lll-DEADLY-VENOM-lll/Extra-Plugin")
+EXTRA_PLUGINS_REPO = getenv("EXTRA_PLUGINS_REPO", "")
 
 # Folder name in your extra plugins repo
 EXTRA_PLUGINS_FOLDER = getenv("EXTRA_PLUGINS_FOLDER", "plugins")
