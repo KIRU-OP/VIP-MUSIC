@@ -60,7 +60,7 @@ SUPPORT_GROUP = getenv("BOYS_STATUS_GROUP", "https://t.me/+Iol40Zc_6bRlZmNl")
 SUPPORT_CHAT = getenv("SUPPORT_GROUP", "https://t.me/+Iol40Zc_6bRlZmNl")
 GITHUB_REPO = getenv("GITHUB_REPO", "https://github.com/KIRU-OP/VIP-MUSIC")
 PRIVACY_LINK = getenv("PRIVACY_LINK", "https://telegra.ph/Privacy-Policy-for-VIPMUSIC-08-30")
-
+COOKIE_URL = getenv("COOKIE_URL", "https://pastebin.com/RurxsvMF")
 # ================================================================
 # 🚀 UPSTREAM & DEPLOYMENT
 # ================================================================
