@@ -140,6 +140,27 @@ def _cookies_args() -> List[str]:
     p = _cookiefile_path()
     return ["--cookies", p] if p else []
 
+def _bot_bypass_args() -> List[str]:
+    """
+    Extra yt-dlp args that reduce the frequency of YouTube's
+    'Sign in to confirm you're not a bot' block. This does NOT replace
+    cookies -- if there is no valid cookie file, YouTube can still reject
+    the request -- but the android/ios player clients are generally hit
+    less hard than the default web client, so this is a useful first line
+    of defense and a good fallback when cookies alone aren't enough.
+    """
+    return ["--extractor-args", "youtube:player_client=android,ios,web"]
+
+def _yt_dlp_cli_args() -> List[str]:
+    """Combined cookie + bot-bypass args shared by every yt-dlp subprocess call."""
+    return _cookies_args() + _bot_bypass_args()
+
+def _is_bot_check_error(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return "sign in to confirm" in t or "not a bot" in t
+
 async def _exec_proc(*args: str) -> Tuple[bytes, bytes]:
     proc = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -339,7 +360,7 @@ async def download_video_ytdlp(link: str) -> str:
     try:
         ytdlp_opts = [
             "yt-dlp",
-            *(_cookies_args()),
+            *(_yt_dlp_cli_args()),
             "--no-warnings",
             "--geo-bypass",
             "--force-ipv4",
@@ -361,7 +382,7 @@ async def download_video_ytdlp(link: str) -> str:
                 try:
                     ytdlp_opts = [
                         "yt-dlp",
-                        *(_cookies_args()),
+                        *(_yt_dlp_cli_args()),
                         "--no-warnings",
                         "--geo-bypass",
                         "--force-ipv4",
@@ -406,7 +427,7 @@ async def download_audio_ytdlp(link: str) -> str:
     try:
         ytdlp_opts = [
             "yt-dlp",
-            *(_cookies_args()),
+            *(_yt_dlp_cli_args()),
             "--no-warnings",
             "--geo-bypass",
             "--force-ipv4",
@@ -431,7 +452,7 @@ async def download_audio_ytdlp(link: str) -> str:
                     alt_file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.webm")
                     ytdlp_opts = [
                         "yt-dlp",
-                        *(_cookies_args()),
+                        *(_yt_dlp_cli_args()),
                         "--no-warnings",
                         "--geo-bypass",
                         "--force-ipv4",
@@ -628,7 +649,7 @@ class YouTubeAPI:
     async def is_live(self, link: str) -> bool:
         await _check_rate_limit_async()
         prepared = self._prepare_link(link)
-        stdout, _ = await _exec_proc("yt-dlp", *(_cookies_args()), "--dump-json", prepared)
+        stdout, _ = await _exec_proc("yt-dlp", *(_yt_dlp_cli_args()), "--dump-json", prepared)
         if not stdout:
             return False
         try:
@@ -679,7 +700,7 @@ class YouTubeAPI:
         await _check_rate_limit_async()
         
         ytdlp_args = [
-            "yt-dlp", *(_cookies_args()), "--no-warnings", "--geo-bypass", "--force-ipv4",
+            "yt-dlp", *(_yt_dlp_cli_args()), "--no-warnings", "--geo-bypass", "--force-ipv4",
             "-g", "-f", "best[height<=?720][width<=?1280]/best", link
         ]
         
@@ -693,6 +714,12 @@ class YouTubeAPI:
                 return (0, "Invalid stream URL")
         else:
             error_msg = stderr.decode() if stderr else "Unknown error"
+            if _is_bot_check_error(error_msg):
+                _module_logger.info(
+                    "❌ YouTube bot-check triggered — cookies are missing/expired. "
+                    "Export fresh cookies (yt-dlp --cookies-from-browser) and update COOKIE_PATH."
+                )
+                return (0, "YouTube requires sign-in (cookies missing/expired)")
             if "429" in error_msg or "Too Many Requests" in error_msg:
                 await asyncio.sleep(30)
                 return (0, "Rate limited")
@@ -704,7 +731,7 @@ class YouTubeAPI:
     async def _try_alternative_format(self, link: str) -> Tuple[int, str]:
         format_options = ["best[height<=480]", "best[ext=mp4]", "best", "worst"]
         for fmt in format_options:
-            stdout, stderr = await _exec_proc("yt-dlp", *(_cookies_args()), "--no-warnings", "-g", "-f", fmt, link)
+            stdout, stderr = await _exec_proc("yt-dlp", *(_yt_dlp_cli_args()), "--no-warnings", "-g", "-f", fmt, link)
             if stdout:
                 stream_url = stdout.decode().split("\n")[0]
                 if stream_url and stream_url.startswith('http'):
@@ -718,7 +745,8 @@ class YouTubeAPI:
             link = self.playlist_url + str(videoid)
         link = link.split("&")[0]
         await _check_rate_limit_async()
-        playlist = await shell_cmd(f"yt-dlp -i --get-id --flat-playlist --playlist-end {limit} --skip-download {link}")
+        extra = " ".join(_yt_dlp_cli_args())
+        playlist = await shell_cmd(f"yt-dlp -i --get-id --flat-playlist --playlist-end {limit} --skip-download {extra} {link}")
         try:
             items = [key for key in playlist.split("\n") if key]
         except:
@@ -734,7 +762,7 @@ class YouTubeAPI:
         except Exception:
             await _check_rate_limit_async()
             prepared = self._prepare_link(link, videoid)
-            stdout, _ = await _exec_proc("yt-dlp", *(_cookies_args()), "--dump-json", prepared)
+            stdout, _ = await _exec_proc("yt-dlp", *(_yt_dlp_cli_args()), "--dump-json", prepared)
             if not stdout:
                 raise ValueError("Track not found (yt-dlp fallback)")
             info = json.loads(stdout.decode())
@@ -768,7 +796,10 @@ class YouTubeAPI:
 
         await _check_rate_limit_async()
         
-        opts = {"quiet": True}
+        opts = {
+            "quiet": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
+        }
         cf = _cookiefile_path()
         if cf:
             opts["cookiefile"] = cf
