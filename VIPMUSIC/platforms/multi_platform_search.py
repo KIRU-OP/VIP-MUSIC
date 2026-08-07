@@ -51,8 +51,8 @@ from VIPMUSIC import LOGGER
 logger = LOGGER(__name__)
 
 # ============ CONFIG ============
-SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "409e31d3ddd64af08cfcc3b0f064fcbe"")
-SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "19609edb1b9f4ed7be0c8c1342039362"")
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "22b6125bfe224587b722d6815002db2b")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "c9c63c6fbf2f467c8bc68624851e9773")
 SOUNDCLOUD_CLIENT_ID = os.environ.get("SOUNDCLOUD_CLIENT_ID", "")
 JIOSAAVN_API_BASE = os.environ.get("JIOSAAVN_API_BASE", "https://saavn.dev/api")
 
