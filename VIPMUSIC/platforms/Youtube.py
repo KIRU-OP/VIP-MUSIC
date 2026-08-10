@@ -51,6 +51,106 @@ FALLBACK_API_URL = "http://13.212.126.0:2020"
 PRIMARY_API_LOADED = False
 FALLBACK_API_LOADED = False
 
+# ============ DOWNLOAD CACHE MANAGEMENT (prevents "No space left on device") ============
+# Root cause of the disk-full crashes: every downloaded file in downloads/ was
+# kept forever (used as a cache) with nothing ever deleting old entries.
+# This section adds automatic LRU + age based eviction so the disk never fills up.
+DOWNLOAD_CACHE_DIR = "downloads"
+MAX_CACHE_SIZE_MB = int(os.environ.get("MAX_CACHE_SIZE_MB", 2048))   # trim cache above this size
+MAX_CACHE_AGE_HOURS = int(os.environ.get("MAX_CACHE_AGE_HOURS", 6))  # delete anything older than this
+MIN_FREE_DISK_MB = int(os.environ.get("MIN_FREE_DISK_MB", 500))      # panic threshold -> aggressive cleanup
+CACHE_CLEANUP_INTERVAL_SEC = int(os.environ.get("CACHE_CLEANUP_INTERVAL_SEC", 600))  # background sweep every 10 min
+
+_cache_cleanup_lock = asyncio.Lock()
+
+
+def _dir_size_and_files(path: str) -> Tuple[int, List[Tuple[str, float, int]]]:
+    """Returns (total_size_bytes, [(filepath, mtime, size_bytes), ...]) for a directory."""
+    total = 0
+    files: List[Tuple[str, float, int]] = []
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file():
+                try:
+                    st = entry.stat()
+                    files.append((entry.path, st.st_mtime, st.st_size))
+                    total += st.st_size
+                except OSError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return total, files
+
+
+def _cleanup_downloads_sync(aggressive: bool = False) -> None:
+    """
+    Blocking cleanup of the downloads/ cache. Always run via cleanup_downloads()
+    (thread executor) so it never blocks the event loop.
+      1. Deletes anything older than MAX_CACHE_AGE_HOURS.
+      2. If still over MAX_CACHE_SIZE_MB (or `aggressive`, e.g. disk almost full),
+         deletes oldest files first (LRU) until back under the target size.
+    """
+    os.makedirs(DOWNLOAD_CACHE_DIR, exist_ok=True)
+    now = time.time()
+    max_age_sec = MAX_CACHE_AGE_HOURS * 3600
+    total, files = _dir_size_and_files(DOWNLOAD_CACHE_DIR)
+
+    kept: List[Tuple[str, float, int]] = []
+    for path, mtime, size in files:
+        if now - mtime > max_age_sec:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+                total -= size
+        else:
+            kept.append((path, mtime, size))
+
+    cap_bytes = MAX_CACHE_SIZE_MB * 1024 * 1024
+    target_bytes = cap_bytes // 2 if aggressive else cap_bytes
+    if total > target_bytes:
+        kept.sort(key=lambda x: x[1])  # oldest (LRU) first
+        for path, mtime, size in kept:
+            if total <= target_bytes:
+                break
+            with contextlib.suppress(OSError):
+                os.remove(path)
+                total -= size
+
+    if aggressive:
+        _module_logger.warning(
+            f"⚠️ Low disk space — aggressively trimmed downloads/ cache (now ~{total // (1024 * 1024)} MB)"
+        )
+
+
+async def cleanup_downloads(aggressive: bool = False) -> None:
+    """Async-safe wrapper: runs the blocking cleanup in a thread executor."""
+    async with _cache_cleanup_lock:
+        await asyncio.get_event_loop().run_in_executor(None, _cleanup_downloads_sync, aggressive)
+
+
+async def _ensure_disk_space() -> None:
+    """
+    Call this immediately before writing a new file to disk. If free space is
+    below MIN_FREE_DISK_MB, forces an aggressive cache trim first so the write
+    doesn't crash with [Errno 28] No space left on device.
+    """
+    try:
+        usage = shutil.disk_usage(os.getcwd())
+        free_mb = usage.free / (1024 * 1024)
+    except OSError:
+        return
+    if free_mb < MIN_FREE_DISK_MB:
+        await cleanup_downloads(aggressive=True)
+
+
+async def _cache_cleanup_loop():
+    """Background task: periodically trims downloads/ so disk never fills up."""
+    while True:
+        try:
+            await cleanup_downloads(aggressive=False)
+        except Exception as e:
+            _module_logger.warning(f"⚠️ Cache cleanup loop error: {e}")
+        await asyncio.sleep(CACHE_CLEANUP_INTERVAL_SEC)
+
 # ============ RATE LIMITING (async â€” does NOT block the event loop) ============
 _request_timestamps = []
 _RATE_LIMIT_WINDOW = 60
@@ -117,13 +217,15 @@ async def load_apis():
 
     return PRIMARY_API_LOADED, FALLBACK_API_LOADED
 
-# Initialize APIs on startup
+# Initialize APIs + start background cache cleanup on startup
 try:
     loop = asyncio.get_event_loop()
     if loop.is_running():
         asyncio.create_task(load_apis())
+        asyncio.create_task(_cache_cleanup_loop())
     else:
         loop.run_until_complete(load_apis())
+        loop.create_task(_cache_cleanup_loop())
 except RuntimeError:
     pass
 
@@ -191,6 +293,7 @@ async def download_song_primary_api(link: str) -> str:
         return file_path
 
     try:
+        await _ensure_disk_space()
         session = await _get_yt_session()
         params = {"url": video_id, "type": "audio", "api_key": SHRUTI_API_KEY}
         async with session.get(
@@ -227,6 +330,7 @@ async def download_video_primary_api(link: str) -> str:
         return file_path
 
     try:
+        await _ensure_disk_space()
         session = await _get_yt_session()
         params = {"url": video_id, "type": "video", "api_key": SHRUTI_API_KEY}
         async with session.get(
@@ -263,6 +367,7 @@ async def download_song_fallback_api(link: str) -> str:
         return file_path
 
     try:
+        await _ensure_disk_space()
         session = await _get_yt_session()
         # Step 1: get token
         async with session.get(
@@ -309,6 +414,7 @@ async def download_video_fallback_api(link: str) -> str:
         return file_path
 
     try:
+        await _ensure_disk_space()
         session = await _get_yt_session()
         # Step 1: get token
         async with session.get(
@@ -356,6 +462,7 @@ async def download_video_ytdlp(link: str) -> str:
         return file_path
 
     await _check_rate_limit_async()
+    await _ensure_disk_space()
 
     try:
         ytdlp_opts = [
@@ -423,7 +530,8 @@ async def download_audio_ytdlp(link: str) -> str:
         return file_path
 
     await _check_rate_limit_async()
-    
+    await _ensure_disk_space()
+
     try:
         ytdlp_opts = [
             "yt-dlp",
