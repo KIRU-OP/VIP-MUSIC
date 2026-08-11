@@ -130,8 +130,9 @@ async def cleanup_downloads(aggressive: bool = False) -> None:
 async def _ensure_disk_space() -> None:
     """
     Call this immediately before writing a new file to disk. If free space is
-    below MIN_FREE_DISK_MB, forces an aggressive cache trim first so the write
-    doesn't crash with [Errno 28] No space left on device.
+    below MIN_FREE_DISK_MB, forces an aggressive cache trim first (both our
+    downloads/ cache and yt-dlp's own cache) so the write doesn't crash with
+    [Errno 28] No space left on device.
     """
     try:
         usage = shutil.disk_usage(os.getcwd())
@@ -140,16 +141,36 @@ async def _ensure_disk_space() -> None:
         return
     if free_mb < MIN_FREE_DISK_MB:
         await cleanup_downloads(aggressive=True)
+        await _cleanup_ytdlp_cache()
 
 
 async def _cache_cleanup_loop():
-    """Background task: periodically trims downloads/ so disk never fills up."""
+    """Background task: periodically trims downloads/ and yt-dlp's own cache so disk never fills up."""
     while True:
         try:
             await cleanup_downloads(aggressive=False)
+            await _cleanup_ytdlp_cache()
         except Exception as e:
             _module_logger.warning(f"⚠️ Cache cleanup loop error: {e}")
         await asyncio.sleep(CACHE_CLEANUP_INTERVAL_SEC)
+
+
+async def _cleanup_ytdlp_cache() -> None:
+    """
+    yt-dlp keeps its own cache (nsig/player responses etc.) outside downloads/,
+    usually under ~/.cache/yt-dlp. This is a separate disk hog from the download
+    cache and won't be touched by cleanup_downloads(), so it's purged here too.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp", "--rm-cache-dir",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+    except Exception:
+        pass
 
 # ============ RATE LIMITING (async â€” does NOT block the event loop) ============
 _request_timestamps = []
