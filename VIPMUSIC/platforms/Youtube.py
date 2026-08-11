@@ -127,21 +127,96 @@ async def cleanup_downloads(aggressive: bool = False) -> None:
         await asyncio.get_event_loop().run_in_executor(None, _cleanup_downloads_sync, aggressive)
 
 
+_last_diag_log_time = 0.0
+_DIAG_LOG_COOLDOWN_SEC = 1800  # only log the full disk breakdown once per 30 min
+
+
 async def _ensure_disk_space() -> None:
     """
     Call this immediately before writing a new file to disk. If free space is
     below MIN_FREE_DISK_MB, forces an aggressive cache trim first (both our
     downloads/ cache and yt-dlp's own cache) so the write doesn't crash with
     [Errno 28] No space left on device.
+
+    Also logs a full disk breakdown (total/used/free + biggest top-level dirs
+    on this filesystem), throttled to once per _DIAG_LOG_COOLDOWN_SEC, so the
+    cause is visible directly in the bot logs without needing separate SSH access.
     """
+    global _last_diag_log_time
     try:
         usage = shutil.disk_usage(os.getcwd())
         free_mb = usage.free / (1024 * 1024)
+        total_mb = usage.total / (1024 * 1024)
+        used_mb = usage.used / (1024 * 1024)
     except OSError:
         return
     if free_mb < MIN_FREE_DISK_MB:
+        cache_mb_before, _ = _dir_size_and_files(DOWNLOAD_CACHE_DIR)
+        cache_mb_before = cache_mb_before / (1024 * 1024)
         await cleanup_downloads(aggressive=True)
         await _cleanup_ytdlp_cache()
+
+        now = time.time()
+        if now - _last_diag_log_time > _DIAG_LOG_COOLDOWN_SEC:
+            _last_diag_log_time = now
+            _module_logger.warning(
+                f"⚠️ DISK DIAGNOSTIC — total={total_mb:.0f}MB used={used_mb:.0f}MB free={free_mb:.0f}MB | "
+                f"downloads/ cache was {cache_mb_before:.0f}MB before trim | "
+                f"non-download usage on this disk ≈ {used_mb - cache_mb_before:.0f}MB "
+                f"(this is what's actually filling the disk — not the bot's download cache)"
+            )
+            await _log_top_disk_consumers()
+
+
+async def _log_top_disk_consumers() -> None:
+    """
+    Logs the top few largest top-level directories under the bot's working
+    directory tree, so the real disk hog shows up directly in bot logs
+    (useful when SSH access to run `du -sh` manually isn't convenient).
+    Runs in a thread executor so it never blocks the event loop; capped to
+    avoid slow scans on huge filesystems.
+    """
+    def _scan():
+        base = os.getcwd()
+        results = []
+        try:
+            with os.scandir(base) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            size = 0
+                            count = 0
+                            for root, dirs, files in os.walk(entry.path, followlinks=False):
+                                for f in files:
+                                    count += 1
+                                    if count > 20000:  # safety cap
+                                        raise StopIteration
+                                    try:
+                                        size += os.path.getsize(os.path.join(root, f))
+                                    except OSError:
+                                        continue
+                            results.append((entry.name, size))
+                        elif entry.is_file(follow_symlinks=False):
+                            try:
+                                results.append((entry.name, entry.stat().st_size))
+                            except OSError:
+                                continue
+                    except (StopIteration, OSError):
+                        continue
+        except OSError:
+            pass
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:8]
+
+    try:
+        top = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _scan), timeout=20
+        )
+        if top:
+            breakdown = ", ".join(f"{name}={size / (1024 * 1024):.0f}MB" for name, size in top)
+            _module_logger.warning(f"⚠️ TOP DISK CONSUMERS (bot working dir): {breakdown}")
+    except Exception:
+        pass
 
 
 async def _cache_cleanup_loop():
