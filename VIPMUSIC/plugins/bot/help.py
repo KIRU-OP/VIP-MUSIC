@@ -28,7 +28,7 @@ HELP_COMMAND = get_command("HELP_COMMAND")
 COLUMN_SIZE = 4
 NUM_COLUMNS = 3
 
-donate = "https://envs.sh/AeS.jpg"
+donate = "https://files.catbox.moe/vcim3s.jpg"
 
 
 class EqInlineKeyboardButton(InlineKeyboardButton):
@@ -470,8 +470,8 @@ async def about_callback(client: Client, callback_query: CallbackQuery):
             ),
         ],
         [
-            InlineKeyboardButton(text="📸ɪɴsᴛᴀ📸", url=f"instagram.com/the.vip.boy"),
-            InlineKeyboardButton(text="▶️ʏᴏᴜᴛᴜʙᴇ▶️", url=f"youtube.com/@THE_VIP_BOY"),
+            InlineKeyboardButton(text="📸ɪɴsᴛᴀ📸", url=f"instagram.com/NEO_.OPS"),
+            InlineKeyboardButton(text="▶️ʏᴏᴜᴛᴜʙᴇ▶️", url=f"https://youtube.com/@hyper_trading_official?si=KMgYDAjlOXSECt_p"),
         ],
         [
             InlineKeyboardButton(text="⬅️ ʙᴀᴄᴋ", callback_data="about")
@@ -777,7 +777,7 @@ async def back_button_callback(client: Client, callback_query: CallbackQuery):
             InlineKeyboardButton(text="👑ᴏᴡɴᴇʀ👑", user_id=config.OWNER_ID[0]),
             InlineKeyboardButton(
                 text="🐙ɢɪᴛʜᴜʙ🐙",
-                url="https://github.com/THE-VIP-BOY-OP",
+                url="https://github.com/KIRU-OP",
             ),
         ],
         [
