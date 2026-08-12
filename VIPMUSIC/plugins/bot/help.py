@@ -258,7 +258,7 @@ from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import BANNED_USERS
-from strings import helpers
+from strings import get_string
 from VIPMUSIC import app
 from VIPMUSIC.utils.decorators.language import languageCB
 
