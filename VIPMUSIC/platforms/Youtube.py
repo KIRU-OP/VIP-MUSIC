@@ -708,13 +708,12 @@ async def download_audio(link: str) -> str:
     result = await download_audio_ytdlp(link)
     if result:
         _module_logger.info("✅ Audio: yt-dlp Success")
-        if result.endswith('.webm'):
-            mp3_path = result.replace('.webm', '.mp3')
-            try:
-                shutil.move(result, mp3_path)
-                return mp3_path
-            except:
-                return result
+        # NOTE: previously this blindly renamed the .webm file to .mp3 via
+        # shutil.move without actually transcoding it. That left real
+        # webm/opus audio bytes inside a file named .mp3 — a container/
+        # extension mismatch that made some tracks "play" (duration/
+        # metadata looked fine) but produce no audio in the voice chat.
+        # Just return the file with its real extension intact.
         return result
     
     _module_logger.info("❌ All audio download methods failed")
@@ -1068,13 +1067,22 @@ class YouTubeAPI:
     ) -> Union[Tuple[str, Optional[bool]], Tuple[None, None]]:
         link = self._prepare_link(link, videoid)
         video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
-        
-        extension = ".webm" if not video else ".mp4"
-        common_file_path = os.path.join("downloads", f"{video_id}{extension}")
-        
-        if os.path.exists(common_file_path) and os.path.getsize(common_file_path) > 10240:
-            _module_logger.info("✅ Local cache")
-            return common_file_path, True
+
+        if video:
+            common_file_path = os.path.join("downloads", f"{video_id}.mp4")
+            if os.path.exists(common_file_path) and os.path.getsize(common_file_path) > 10240:
+                _module_logger.info("✅ Local cache")
+                return common_file_path, True
+        else:
+            # Audio can legitimately be saved as .mp3 (Shruti APIs) or
+            # .webm (yt-dlp) — check every real extension we might have
+            # saved it under instead of assuming a single fixed one.
+            common_file_path = os.path.join("downloads", f"{video_id}.webm")  # default target if nothing cached yet
+            for ext in (".mp3", ".webm", ".m4a", ".ogg", ".opus"):
+                candidate = os.path.join("downloads", f"{video_id}{ext}")
+                if os.path.exists(candidate) and os.path.getsize(candidate) > 10240:
+                    _module_logger.info("✅ Local cache")
+                    return candidate, True
 
         if songvideo or video:
             try:
@@ -1131,10 +1139,22 @@ class YouTubeAPI:
 
             if audio_result:
                 _module_logger.info("✅ Audio downloaded (race winner)")
-                if audio_result != common_file_path:
+                # IMPORTANT: keep the file's real extension (.mp3 from the
+                # Shruti APIs, .webm from yt-dlp, etc). Previously this
+                # force-renamed every result to a single hardcoded
+                # extension (common_file_path, always .webm) without ever
+                # transcoding it — so a genuine mp3 file ended up on disk
+                # named "xyz.webm". That container/extension mismatch is
+                # why some songs would "play" (the bot picked up
+                # title/duration fine) but no sound came through in the
+                # voice chat: the player couldn't correctly decode a file
+                # whose real codec didn't match its extension.
+                real_ext = os.path.splitext(audio_result)[1] or ".webm"
+                target_path = os.path.join("downloads", f"{video_id}{real_ext}")
+                if audio_result != target_path:
                     try:
-                        shutil.move(audio_result, common_file_path)
-                        return common_file_path, True
+                        shutil.move(audio_result, target_path)
+                        return target_path, True
                     except Exception:
                         return audio_result, True
                 return audio_result, True
