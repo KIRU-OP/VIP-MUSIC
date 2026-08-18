@@ -8,7 +8,7 @@ import yt_dlp
 
 from VIPMUSIC.utils.cookie_handler import COOKIE_PATH
 
-_logger = logging.getLogger("AnonMusic.utils.yt_dlp_download")
+_logger = logging.getLogger("VIPMUSIC.utils.yt_dlp_download")
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
