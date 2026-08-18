@@ -10,7 +10,9 @@ def capture_internal_err(func):
         try:
             return await func(*args, **kwargs)
         except Exception as e:
-            _logger.error(f"Internal error in {func.__name__}: {e}", exc_info=True)
+            _logger.error(
+                "Internal error in %s: %s", func.__name__, e, exc_info=True
+            )
             return None
 
     return wrapper
