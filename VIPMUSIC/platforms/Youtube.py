@@ -13,19 +13,19 @@ from urllib.parse import urlparse
 import yt_dlp
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
-from youtubesearchpython.__future__ import VideosSearch
+from py_yt import VideosSearch
 
-from VIPMUSIC.utils.cookie_handler import COOKIE_PATH
-from VIPMUSIC.utils.database import is_on_off
-from VIPMUSIC.utils.downloader import download_audio_concurrent, yt_dlp_download
-from VIPMUSIC.utils.errors import capture_internal_err
-from VIPMUSIC.utils.formatters import time_to_seconds
-from VIPMUSIC.utils.tuning import (
+from AnonMusic.utils.cookie_handler import COOKIE_PATH
+from AnonMusic.utils.database import is_on_off
+from AnonMusic.utils.downloader import download_audio_concurrent, yt_dlp_download
+from AnonMusic.utils.errors import capture_internal_err
+from AnonMusic.utils.formatters import time_to_seconds
+from AnonMusic.utils.tuning import (
     YTDLP_TIMEOUT,
     YOUTUBE_META_MAX,
     YOUTUBE_META_TTL,
 )
-from VIPMUSIC import LOGGER
+from AnonMusic import LOGGER
 
 _module_logger = LOGGER(__name__)
 
@@ -35,7 +35,7 @@ _formats_cache: Dict[str, Tuple[float, List[Dict], str]] = {}
 _formats_lock = asyncio.Lock()
 
 # ============ API CONFIGURATION ============
-SHRUTI_API_KEY = "ShrutiBotsL0zQEKsazSrYS2LWsIQW"
+SHRUTI_API_KEY = "ShrutiBotsOU2K57cQppXuv38Cz2Xf"
 
 # API 1: Primary Shruti API (Direct Download)
 PRIMARY_API_URL = "https://api.shrutibots.site"
@@ -47,9 +47,16 @@ FALLBACK_API_URL = "http://13.212.126.0:2020"
 # Endpoint 1: /download?url={video_id}&type=audio -> returns {"download_token": "xxx"}
 # Endpoint 2: /stream/{video_id}?type=audio with header X-Download-Token
 
+# API 3: Worker Fallback API (Direct Download, Cloudflare Worker)
+WORKER_FALLBACK_API_URL = os.environ.get("WORKER_FALLBACK_API_URL", "https://youtubenewapi.skybotsdeveloper.workers.dev")
+WORKER_FALLBACK_API_KEY = os.environ.get("WORKER_FALLBACK_API_KEY", "itsmesid")
+# Endpoint: /download?url={video_id}&type=audio&key={KEY}
+# Response: Direct file download
+
 # API URLs loaded status
 PRIMARY_API_LOADED = False
 FALLBACK_API_LOADED = False
+WORKER_FALLBACK_API_LOADED = False
 
 # ============ DOWNLOAD CACHE MANAGEMENT (prevents "No space left on device") ============
 # Root cause of the disk-full crashes: every downloaded file in downloads/ was
@@ -285,8 +292,8 @@ async def _get_yt_session() -> aiohttp.ClientSession:
 
 
 async def load_apis():
-    """Load and verify APIs â€” only checks non-empty URLs."""
-    global PRIMARY_API_LOADED, FALLBACK_API_LOADED
+    """Load and verify APIs - only checks non-empty URLs."""
+    global PRIMARY_API_LOADED, FALLBACK_API_LOADED, WORKER_FALLBACK_API_LOADED
     logger = LOGGER("VISHALMUSIC.platforms.Youtube.py")
 
     if PRIMARY_API_URL:
@@ -295,11 +302,11 @@ async def load_apis():
             async with session.get(f"{PRIMARY_API_URL}/", timeout=aiohttp.ClientTimeout(total=8)) as response:
                 if response.status == 200:
                     PRIMARY_API_LOADED = True
-                    logger.info(f"âœ… PRIMARY API loaded: {PRIMARY_API_URL}")
+                    logger.info(f"[OK] PRIMARY API loaded: {PRIMARY_API_URL}")
                 else:
-                    logger.warning(f"âš ï¸ Primary API status {response.status}")
+                    logger.warning(f"[WARN] Primary API status {response.status}")
         except Exception as e:
-            logger.warning(f"âš ï¸ Primary API unreachable: {e}")
+            logger.warning(f"[WARN] Primary API unreachable: {e}")
 
     if FALLBACK_API_URL:  # only check when a URL is actually configured
         try:
@@ -307,11 +314,23 @@ async def load_apis():
             async with session.get(f"{FALLBACK_API_URL}/", timeout=aiohttp.ClientTimeout(total=8)) as response:
                 if response.status == 200:
                     FALLBACK_API_LOADED = True
-                    logger.info(f"âœ… FALLBACK API loaded: {FALLBACK_API_URL}")
+                    logger.info(f"[OK] FALLBACK API loaded: {FALLBACK_API_URL}")
         except Exception as e:
-            logger.warning(f"âš ï¸ Fallback API unreachable: {e}")
+            logger.warning(f"[WARN] Fallback API unreachable: {e}")
 
-    return PRIMARY_API_LOADED, FALLBACK_API_LOADED
+    if WORKER_FALLBACK_API_URL:
+        try:
+            session = await _get_yt_session()
+            async with session.get(f"{WORKER_FALLBACK_API_URL}/", timeout=aiohttp.ClientTimeout(total=8)) as response:
+                if response.status == 200:
+                    WORKER_FALLBACK_API_LOADED = True
+                    logger.info(f"[OK] WORKER FALLBACK API loaded: {WORKER_FALLBACK_API_URL}")
+                else:
+                    logger.warning(f"[WARN] Worker Fallback API status {response.status}")
+        except Exception as e:
+            logger.warning(f"[WARN] Worker Fallback API unreachable: {e}")
+
+    return PRIMARY_API_LOADED, FALLBACK_API_LOADED, WORKER_FALLBACK_API_LOADED
 
 # Initialize APIs + start background cache cleanup on startup
 try:
@@ -542,6 +561,81 @@ async def download_video_fallback_api(link: str) -> str:
         return None
 
 
+# ============ API 3: WORKER FALLBACK API (DIRECT DOWNLOAD, CLOUDFLARE WORKER) ============
+async def download_song_worker_api(link: str) -> str:
+    """Worker Fallback API - Direct download with API key (shared session, 1 MB chunks)."""
+    if not WORKER_FALLBACK_API_URL:
+        return None
+    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
+    if not video_id or len(video_id) < 3:
+        return None
+
+    DOWNLOAD_DIR = "downloads"
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
+
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        return file_path
+
+    try:
+        await _ensure_disk_space()
+        session = await _get_yt_session()
+        params = {"url": video_id, "type": "audio", "key": WORKER_FALLBACK_API_KEY}
+        async with session.get(
+            f"{WORKER_FALLBACK_API_URL}/download",
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as response:
+            if response.status != 200:
+                return None
+            async with aiofiles.open(file_path, "wb") as f:
+                async for chunk in response.content.iter_chunked(1 << 20):  # 1 MB
+                    await f.write(chunk)
+
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            return file_path
+        return None
+    except Exception:
+        return None
+
+
+async def download_video_worker_api(link: str) -> str:
+    """Worker Fallback API - Video download with API key (shared session, 1 MB chunks)."""
+    if not WORKER_FALLBACK_API_URL:
+        return None
+    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
+    if not video_id or len(video_id) < 3:
+        return None
+
+    DOWNLOAD_DIR = "downloads"
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp4")
+
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        return file_path
+
+    try:
+        await _ensure_disk_space()
+        session = await _get_yt_session()
+        params = {"url": video_id, "type": "video", "key": WORKER_FALLBACK_API_KEY}
+        async with session.get(
+            f"{WORKER_FALLBACK_API_URL}/download",
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=180),
+        ) as response:
+            if response.status != 200:
+                return None
+            async with aiofiles.open(file_path, "wb") as f:
+                async for chunk in response.content.iter_chunked(1 << 20):  # 1 MB
+                    await f.write(chunk)
+
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            return file_path
+        return None
+    except Exception:
+        return None
+
+
 # ============ YT-DLP FALLBACK ============
 async def download_video_ytdlp(link: str) -> str:
     """Download video using yt-dlp directly"""
@@ -687,7 +781,7 @@ async def download_audio_ytdlp(link: str) -> str:
 # ============ MAIN DOWNLOAD FUNCTIONS (API1 -> API2 -> YTDLP) ============
 async def download_audio(link: str) -> str:
     """
-    Main audio download - Primary API -> Fallback API -> yt-dlp
+    Main audio download - Primary API -> Fallback API -> Worker Fallback API -> yt-dlp
     """
     # 1. TRY PRIMARY API FIRST
     _module_logger.info("🎵 Audio Download - Trying Primary API (Direct)...")
@@ -702,18 +796,26 @@ async def download_audio(link: str) -> str:
     if result:
         _module_logger.info("✅ Audio: Fallback API Success")
         return result
-    
-    # 3. TRY YT-DLP AS LAST RESORT
-    _module_logger.info("🔄 Audio - Both APIs failed, trying yt-dlp fallback...")
+
+    # 3. TRY WORKER FALLBACK API (DIRECT DOWNLOAD)
+    _module_logger.info("🔄 Audio - Fallback API failed, trying Worker Fallback API...")
+    result = await download_song_worker_api(link)
+    if result:
+        _module_logger.info("✅ Audio: Worker Fallback API Success")
+        return result
+
+    # 4. TRY YT-DLP AS LAST RESORT
+    _module_logger.info("🔄 Audio - All APIs failed, trying yt-dlp fallback...")
     result = await download_audio_ytdlp(link)
     if result:
         _module_logger.info("✅ Audio: yt-dlp Success")
-        # NOTE: previously this blindly renamed the .webm file to .mp3 via
-        # shutil.move without actually transcoding it. That left real
-        # webm/opus audio bytes inside a file named .mp3 — a container/
-        # extension mismatch that made some tracks "play" (duration/
-        # metadata looked fine) but produce no audio in the voice chat.
-        # Just return the file with its real extension intact.
+        if result.endswith('.webm'):
+            mp3_path = result.replace('.webm', '.mp3')
+            try:
+                shutil.move(result, mp3_path)
+                return mp3_path
+            except:
+                return result
         return result
     
     _module_logger.info("❌ All audio download methods failed")
@@ -722,7 +824,7 @@ async def download_audio(link: str) -> str:
 
 async def download_video(link: str) -> str:
     """
-    Main video download - Primary API -> Fallback API -> yt-dlp
+    Main video download - Primary API -> Fallback API -> Worker Fallback API -> yt-dlp
     """
     # 1. TRY PRIMARY API FIRST
     _module_logger.info("🎬 Video Download - Trying Primary API (Direct)...")
@@ -737,9 +839,16 @@ async def download_video(link: str) -> str:
     if result:
         _module_logger.info("✅ Video: Fallback API Success")
         return result
-    
-    # 3. TRY YT-DLP AS LAST RESORT
-    _module_logger.info("🔄 Video - Both APIs failed, trying yt-dlp fallback...")
+
+    # 3. TRY WORKER FALLBACK API (DIRECT DOWNLOAD)
+    _module_logger.info("🔄 Video - Fallback API failed, trying Worker Fallback API...")
+    result = await download_video_worker_api(link)
+    if result:
+        _module_logger.info("✅ Video: Worker Fallback API Success")
+        return result
+
+    # 4. TRY YT-DLP AS LAST RESORT
+    _module_logger.info("🔄 Video - All APIs failed, trying yt-dlp fallback...")
     result = await download_video_ytdlp(link)
     if result:
         _module_logger.info("✅ Video: yt-dlp Success")
@@ -931,6 +1040,39 @@ class YouTubeAPI:
             else:
                 return (0, error_msg)
 
+    async def _get_audio_stream_url(self, link: str) -> Optional[str]:
+        """
+        Last-resort audio fallback: ask yt-dlp for a direct playable stream URL
+        (no file written to disk) instead of downloading. Used when the Shruti
+        APIs are down AND every file-download method (primary/fallback API,
+        yt-dlp, concurrent downloader) has failed. Mirrors what video() already
+        does for video streams.
+        """
+        await _check_rate_limit_async()
+        ytdlp_args = [
+            "yt-dlp", *(_yt_dlp_cli_args()), "--no-warnings", "--geo-bypass", "--force-ipv4",
+            "-g", "-f", "bestaudio/best", link
+        ]
+        stdout, stderr = await _exec_proc(*ytdlp_args)
+
+        if stdout:
+            stream_url = stdout.decode().split("\n")[0]
+            if stream_url and stream_url.startswith("http"):
+                return stream_url
+            return None
+
+        error_msg = stderr.decode() if stderr else "Unknown error"
+        if _is_bot_check_error(error_msg):
+            _module_logger.info(
+                "❌ Audio stream fallback: YouTube bot-check triggered — cookies are "
+                "missing/expired. Export fresh cookies and update COOKIE_PATH."
+            )
+        elif "429" in error_msg or "Too Many Requests" in error_msg:
+            _module_logger.info("❌ Audio stream fallback: rate limited (429).")
+        else:
+            _module_logger.info(f"❌ Audio stream fallback failed: {error_msg.strip()[:300]}")
+        return None
+
     async def _try_alternative_format(self, link: str) -> Tuple[int, str]:
         format_options = ["best[height<=480]", "best[ext=mp4]", "best", "worst"]
         for fmt in format_options:
@@ -1067,22 +1209,13 @@ class YouTubeAPI:
     ) -> Union[Tuple[str, Optional[bool]], Tuple[None, None]]:
         link = self._prepare_link(link, videoid)
         video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
-
-        if video:
-            common_file_path = os.path.join("downloads", f"{video_id}.mp4")
-            if os.path.exists(common_file_path) and os.path.getsize(common_file_path) > 10240:
-                _module_logger.info("✅ Local cache")
-                return common_file_path, True
-        else:
-            # Audio can legitimately be saved as .mp3 (Shruti APIs) or
-            # .webm (yt-dlp) — check every real extension we might have
-            # saved it under instead of assuming a single fixed one.
-            common_file_path = os.path.join("downloads", f"{video_id}.webm")  # default target if nothing cached yet
-            for ext in (".mp3", ".webm", ".m4a", ".ogg", ".opus"):
-                candidate = os.path.join("downloads", f"{video_id}{ext}")
-                if os.path.exists(candidate) and os.path.getsize(candidate) > 10240:
-                    _module_logger.info("✅ Local cache")
-                    return candidate, True
+        
+        extension = ".webm" if not video else ".mp4"
+        common_file_path = os.path.join("downloads", f"{video_id}{extension}")
+        
+        if os.path.exists(common_file_path) and os.path.getsize(common_file_path) > 10240:
+            _module_logger.info("✅ Local cache")
+            return common_file_path, True
 
         if songvideo or video:
             try:
@@ -1118,11 +1251,12 @@ class YouTubeAPI:
                 return await download_audio_concurrent(link)
 
             # Race: first successful result wins
-            tasks = [
-                asyncio.create_task(_try_primary()),
-                asyncio.create_task(_try_ytdlp()),
-                asyncio.create_task(_try_concurrent()),
-            ]
+            task_map = {
+                asyncio.create_task(_try_primary()): "primary/fallback API + yt-dlp",
+                asyncio.create_task(_try_ytdlp()): "yt_dlp_download",
+                asyncio.create_task(_try_concurrent()): "download_audio_concurrent",
+            }
+            tasks = list(task_map.keys())
 
             audio_result = None
             for coro in asyncio.as_completed(tasks):
@@ -1134,32 +1268,31 @@ class YouTubeAPI:
                         for t in tasks:
                             t.cancel()
                         break
-                except Exception:
+                except Exception as e:
+                    _module_logger.info(f"❌ Audio race method '{task_map.get(coro, '?')}' failed: {e}")
                     continue
 
             if audio_result:
                 _module_logger.info("✅ Audio downloaded (race winner)")
-                # IMPORTANT: keep the file's real extension (.mp3 from the
-                # Shruti APIs, .webm from yt-dlp, etc). Previously this
-                # force-renamed every result to a single hardcoded
-                # extension (common_file_path, always .webm) without ever
-                # transcoding it — so a genuine mp3 file ended up on disk
-                # named "xyz.webm". That container/extension mismatch is
-                # why some songs would "play" (the bot picked up
-                # title/duration fine) but no sound came through in the
-                # voice chat: the player couldn't correctly decode a file
-                # whose real codec didn't match its extension.
-                real_ext = os.path.splitext(audio_result)[1] or ".webm"
-                target_path = os.path.join("downloads", f"{video_id}{real_ext}")
-                if audio_result != target_path:
+                if audio_result != common_file_path:
                     try:
-                        shutil.move(audio_result, target_path)
-                        return target_path, True
+                        shutil.move(audio_result, common_file_path)
+                        return common_file_path, True
                     except Exception:
                         return audio_result, True
                 return audio_result, True
 
-            _module_logger.info("❌ All audio download methods failed")
+            # ── LAST RESORT: every file-download method failed (e.g. both custom
+            # APIs down). Instead of giving up, ask yt-dlp for a direct playable
+            # stream URL — no file needed, so this works even with zero disk space
+            # or when the download APIs are unreachable. ──
+            _module_logger.info("⚠️ All audio download methods failed — trying direct stream URL fallback...")
+            stream_url = await self._get_audio_stream_url(link)
+            if stream_url:
+                _module_logger.info("✅ Audio: direct stream URL fallback succeeded")
+                return stream_url, None
+
+            _module_logger.info("❌ All audio download methods AND stream fallback failed")
             return None, None
 
 YouTube = YouTubeAPI()
