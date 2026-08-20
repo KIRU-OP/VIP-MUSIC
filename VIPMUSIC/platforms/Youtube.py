@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import yt_dlp
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
-from py_yt import VideosSearch
+from youtubesearchpython.__future__ import VideosSearch
 
 from VIPMUSIC.utils.cookie_handler import COOKIE_PATH
 from VIPMUSIC.utils.database import is_on_off
