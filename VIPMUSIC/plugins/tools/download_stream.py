@@ -11,8 +11,9 @@ from youtubesearchpython import SearchVideos
 from VIPMUSIC import app
 
 # ----------------------------------------------------------------------------
-# Spam-tracking (kept SEPARATE for video vs audio, unlike the original which
-# shared one dict and accidentally rate-limited both together)
+# Spam-tracking (kept SEPARATE for video vs audio - the original shared one
+# dict, which meant downloading a video also blocked audio downloads for the
+# same user and vice versa)
 # ----------------------------------------------------------------------------
 user_last_video_query_time = {}
 user_last_audio_query_time = {}
@@ -23,79 +24,115 @@ SPAM_AUDIO_WINDOW_SECONDS = 30
 BANNED_USERS = []
 
 # ----------------------------------------------------------------------------
-# cobalt.tools public API
-# Docs (subject to change): https://github.com/imputnet/cobalt
-# NOTE: This is a third-party free API. It can go down, rate-limit you, or
-# change its response shape without notice. Test it before relying on it.
-# If it stops working, you'll need to swap COBALT_API_URL for a different
-# provider (self-hosted cobalt instance, RapidAPI downloader, etc.) and
-# adjust `cobalt_request()` to match that provider's request/response format.
+# Download API cascade: Primary -> Fallback (token based) -> Worker
+# NOTE: All three are third-party/self-run services outside Anthropic's
+# control. I have not verified any of these are currently live or that
+# their response shapes match the comments below - treat these as your
+# best-known contract and adjust parsing if a real response differs.
+#
+# SECURITY: move SHRUTI_API_KEY to an environment variable like the worker
+# key below, rather than hardcoding it here. If this key has already been
+# shared/pasted elsewhere, rotate it.
 # ----------------------------------------------------------------------------
-COBALT_API_URL = "https://api.cobalt.tools/api/json"
+SHRUTI_API_KEY = os.environ.get("SHRUTI_API_KEY", "ShrutiBotsPAVXJFsXdDeoJqDOe4NW")
+PRIMARY_API_URL = "https://api.shrutibots.site"
+
+FALLBACK_API_URL = "http://13.212.126.0:2020"
+
+WORKER_FALLBACK_API_URL = os.environ.get(
+    "WORKER_FALLBACK_API_URL", "https://youtubenewapi.skybotsdeveloper.workers.dev"
+)
+WORKER_FALLBACK_API_KEY = os.environ.get("WORKER_FALLBACK_API_KEY", "itsmesid")
+
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=60)
 
 
-async def cobalt_request(youtube_url: str, audio_only: bool) -> dict:
+async def _stream_response_to_file(resp: aiohttp.ClientResponse, dest_path: str) -> str:
+    with open(dest_path, "wb") as f:
+        async for chunk in resp.content.iter_chunked(1024 * 256):
+            f.write(chunk)
+    return dest_path
+
+
+async def _try_primary(video_url: str, media_type: str, dest_path: str) -> str:
     """
-    Calls the cobalt.tools API and returns its parsed JSON response.
-    Raises Exception on network/API errors.
+    Primary Shruti API - direct download.
+    GET /download?url={video_url}&type={media_type}&api_key={KEY}
     """
-    payload = {
-        "url": youtube_url,
-        "isAudioOnly": audio_only,
-        "aFormat": "mp3",
-        "vCodec": "h264",
-        "vQuality": "720",
-        "filenamePattern": "basic",
-    }
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    params = {"url": video_url, "type": media_type, "api_key": SHRUTI_API_KEY}
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        async with session.get(f"{PRIMARY_API_URL}/download", params=params) as resp:
+            if resp.status != 200:
+                raise Exception(f"primary API HTTP {resp.status}: {await resp.text()}")
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                raise Exception(f"primary API returned JSON, not a file: {await resp.text()}")
+            return await _stream_response_to_file(resp, dest_path)
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            COBALT_API_URL, json=payload, headers=headers, timeout=30
+
+async def _try_fallback(video_url: str, video_id: str, media_type: str, dest_path: str) -> str:
+    """
+    Legacy/fallback API - two step, token based.
+    Step 1: GET /download?url={video_url}&type={media_type} -> {"download_token": "xxx"}
+    Step 2: GET /stream/{video_id}?type={media_type}  header X-Download-Token: token
+    """
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        params = {"url": video_url, "type": media_type}
+        async with session.get(f"{FALLBACK_API_URL}/download", params=params) as resp:
+            if resp.status != 200:
+                raise Exception(f"fallback API (token step) HTTP {resp.status}: {await resp.text()}")
+            data = await resp.json()
+            token = data.get("download_token")
+            if not token:
+                raise Exception(f"fallback API did not return a download_token: {data}")
+
+        headers = {"X-Download-Token": token}
+        stream_params = {"type": media_type}
+        async with session.get(
+            f"{FALLBACK_API_URL}/stream/{video_id}", headers=headers, params=stream_params
         ) as resp:
             if resp.status != 200:
-                text = await resp.text()
-                raise Exception(f"cobalt API returned HTTP {resp.status}: {text}")
-            data = await resp.json()
-
-    status = data.get("status")
-    if status in ("error", "rate-limit"):
-        raise Exception(f"cobalt API error: {data.get('text', data)}")
-    if status not in ("stream", "redirect", "picker"):
-        raise Exception(f"Unexpected cobalt API response: {data}")
-
-    return data
+                raise Exception(f"fallback API (stream step) HTTP {resp.status}: {await resp.text()}")
+            return await _stream_response_to_file(resp, dest_path)
 
 
-async def cobalt_download_url(youtube_url: str, audio_only: bool) -> str:
+async def _try_worker(video_url: str, media_type: str, dest_path: str) -> str:
     """
-    Returns a direct, downloadable media URL for the given YouTube link.
+    Cloudflare worker fallback - direct download.
+    GET /download?url={video_url}&type={media_type}&key={KEY}
     """
-    data = await cobalt_request(youtube_url, audio_only)
-
-    if data["status"] == "picker":
-        # Multiple options returned (e.g. separate audio/video streams) -
-        # just take the first one.
-        picks = data.get("picker", [])
-        if not picks:
-            raise Exception("cobalt API returned an empty picker list")
-        return picks[0]["url"]
-
-    return data["url"]
-
-
-async def download_file(url: str, dest_path: str) -> str:
-    """
-    Streams `url` to `dest_path` using aiohttp (async, non-blocking).
-    """
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=None)) as resp:
+    params = {"url": video_url, "type": media_type, "key": WORKER_FALLBACK_API_KEY}
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+        async with session.get(f"{WORKER_FALLBACK_API_URL}/download", params=params) as resp:
             if resp.status != 200:
-                raise Exception(f"Failed to fetch file, HTTP {resp.status}")
-            with open(dest_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 256):
-                    f.write(chunk)
-    return dest_path
+                raise Exception(f"worker API HTTP {resp.status}: {await resp.text()}")
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                raise Exception(f"worker API returned JSON, not a file: {await resp.text()}")
+            return await _stream_response_to_file(resp, dest_path)
+
+
+async def fetch_media(video_url: str, video_id: str, media_type: str, dest_path: str) -> str:
+    """
+    Tries Primary -> Fallback -> Worker in order. Returns the local file path
+    of the first one that succeeds. Raises Exception with all three errors
+    combined if every provider fails.
+    """
+    errors = []
+
+    for name, coro in (
+        ("primary", _try_primary(video_url, media_type, dest_path)),
+        ("fallback", _try_fallback(video_url, video_id, media_type, dest_path)),
+        ("worker", _try_worker(video_url, media_type, dest_path)),
+    ):
+        try:
+            return await coro
+        except Exception as e:
+            errors.append(f"[{name}] {e}")
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+
+    raise Exception(" | ".join(errors))
 
 
 # ----------------------------------------------------------------------------
@@ -149,8 +186,7 @@ async def download_video(client, CallbackQuery):
 
     file_path = f"{video_id}.mp4"
     try:
-        direct_url = await cobalt_download_url(mo, audio_only=False)
-        await download_file(direct_url, file_path)
+        await fetch_media(mo, video_id, "video", file_path)
     except Exception as e:
         await pablo.edit(f"**ʜᴇʏ {mention} ғᴀɪʟᴇᴅ ᴛᴏ ᴅᴏᴡɴʟᴏᴀᴅ.** \n**ᴇʀʀᴏʀ:** `{str(e)}`")
         if thumb_path and os.path.exists(thumb_path):
@@ -232,8 +268,7 @@ async def download_audio(client, CallbackQuery):
 
     file_path = f"{video_id}.mp3"
     try:
-        direct_url = await cobalt_download_url(mo, audio_only=True)
-        await download_file(direct_url, file_path)
+        await fetch_media(mo, video_id, "audio", file_path)
     except Exception as e:
         await pablo.edit(f"**ʜᴇʏ {mention} ғᴀɪʟᴇᴅ ᴛᴏ ᴅᴏᴡɴʟᴏᴀᴅ.** \n**ᴇʀʀᴏʀ:** `{str(e)}`")
         if thumb_path and os.path.exists(thumb_path):
