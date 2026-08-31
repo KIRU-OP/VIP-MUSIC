@@ -1107,10 +1107,25 @@ class YouTubeAPI:
         except Exception:
             await _check_rate_limit_async()
             prepared = self._prepare_link(link, videoid)
-            stdout, _ = await _exec_proc("yt-dlp", *(_yt_dlp_cli_args()), "--dump-json", prepared)
+            stdout, stderr = await _exec_proc("yt-dlp", *(_yt_dlp_cli_args()), "--dump-json", prepared)
             if not stdout:
+                error_msg = stderr.decode() if stderr else "Unknown error"
+                if _is_bot_check_error(error_msg):
+                    _module_logger.info(
+                        "❌ track(): YouTube bot-check triggered — cookies are missing/expired. "
+                        "Export fresh cookies (yt-dlp --cookies-from-browser) and update COOKIE_PATH."
+                    )
+                    raise ValueError("YouTube requires sign-in (cookies missing/expired)")
+                if "429" in error_msg or "Too Many Requests" in error_msg:
+                    _module_logger.info("❌ track(): rate limited (429) by YouTube.")
+                    raise ValueError("Rate limited")
+                _module_logger.info(f"❌ track(): yt-dlp fallback failed: {error_msg.strip()[:300]}")
                 raise ValueError("Track not found (yt-dlp fallback)")
-            info = json.loads(stdout.decode())
+            try:
+                info = json.loads(stdout.decode())
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                _module_logger.info(f"❌ track(): failed to parse yt-dlp JSON output: {e}")
+                raise ValueError("Track not found (invalid yt-dlp output)")
         thumb = (info.get("thumbnail") or info.get("thumbnails", [{}])[0].get("url", "")).split("?")[0]
         _dur = info.get("duration")
         if isinstance(_dur, str) and _dur:
