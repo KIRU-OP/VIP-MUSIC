@@ -17,7 +17,7 @@ from youtubesearchpython.__future__ import VideosSearch
 
 from VIPMUSIC.utils.cookie_handler import COOKIE_PATH
 from VIPMUSIC.utils.database import is_on_off
-from VIPMUSIC.utils.downloader import download_audio_concurrent, yt_dlp_download
+from VIPMUSIC.utils.downloader import yt_dlp_download
 from VIPMUSIC.utils.errors import capture_internal_err
 from VIPMUSIC.utils.formatters import time_to_seconds
 from VIPMUSIC.utils.tuning import (
@@ -1240,21 +1240,26 @@ class YouTubeAPI:
                 return None, None
 
         else:
-            # ── LIGHTNING FAST: Race all download methods concurrently ──
+            # ── LIGHTNING FAST: Race download methods concurrently ──
+            # NOTE: _try_ytdlp and a former "_try_concurrent" both called the
+            # exact same yt_dlp_download() against the exact same output path
+            # (downloads/{video_id}.webm). Running that twice in parallel made
+            # two yt-dlp processes write to the same .webm.part file at once,
+            # so whichever process finished second couldn't find its .part
+            # file anymore (already renamed by the first) and crashed with
+            # "Unable to rename file: No such file or directory". Racing the
+            # same download method against itself never added a real chance
+            # of success anyway, so the duplicate task has been removed.
             async def _try_primary():
                 return await download_audio(link)
 
             async def _try_ytdlp():
                 return await yt_dlp_download(link, type="audio")
 
-            async def _try_concurrent():
-                return await download_audio_concurrent(link)
-
             # Race: first successful result wins
             task_map = {
                 asyncio.create_task(_try_primary()): "primary/fallback API + yt-dlp",
                 asyncio.create_task(_try_ytdlp()): "yt_dlp_download",
-                asyncio.create_task(_try_concurrent()): "download_audio_concurrent",
             }
             tasks = list(task_map.keys())
 
