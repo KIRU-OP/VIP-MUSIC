@@ -13,7 +13,6 @@ from urllib.parse import urlparse
 import yt_dlp
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
-from youtubesearchpython.__future__ import VideosSearch
 
 from VIPMUSIC.utils.cookie_handler import COOKIE_PATH
 from VIPMUSIC.utils.database import is_on_off
@@ -36,6 +35,13 @@ _formats_lock = asyncio.Lock()
 
 # ============ API CONFIGURATION ============
 SHRUTI_API_KEY = "ShrutiBotsPAVXJFsXdDeoJqDOe4NW"
+
+# YouTube Data API v3 (official) — used for all search/metadata lookups.
+# Replaces the old youtubesearchpython scraper, which broke silently whenever
+# YouTube changed its page markup. Get a key from Google Cloud Console
+# (enable "YouTube Data API v3") and set it as an env var.
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+YOUTUBE_V3_BASE_URL = "https://www.googleapis.com/youtube/v3"
 
 # API 1: Primary Shruti API (Direct Download)
 PRIMARY_API_URL = "https://api.shrutibots.site"
@@ -858,6 +864,134 @@ async def download_video(link: str) -> str:
     return None
 
 
+# ============ YOUTUBE DATA API v3 (SEARCH) ============
+# Normalizes results into the same shape youtubesearchpython used to return
+# ({"id", "title", "duration", "thumbnails": [{"url": ...}], "link", "channel"})
+# so every existing consumer below (title/duration/thumbnail/details/track/
+# slider) keeps working unchanged.
+
+_ISO8601_DUR_RE = re.compile(
+    r"^P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?$"
+)
+
+
+def _iso8601_duration_to_str(iso: Optional[str]) -> Optional[str]:
+    """Convert YouTube's 'PT#H#M#S' duration into 'M:SS' / 'H:MM:SS' text,
+    matching youtubesearchpython's old string format. Live streams report
+    durations like 'P0D' (no time component) -> treated as None, same as
+    youtubesearchpython did for ongoing livestreams."""
+    if not iso:
+        return None
+    m = _ISO8601_DUR_RE.match(iso)
+    if not m:
+        return None
+    days = int(m.group("days") or 0)
+    hours = int(m.group("hours") or 0) + days * 24
+    minutes = int(m.group("minutes") or 0)
+    seconds = int(m.group("seconds") or 0)
+    total = hours * 3600 + minutes * 60 + seconds
+    if total <= 0:
+        return None
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+async def _youtube_v3_video_durations(video_ids: List[str]) -> Dict[str, Optional[str]]:
+    """Batch-fetch contentDetails.duration for up to 50 video IDs in one call."""
+    if not video_ids or not YOUTUBE_API_KEY:
+        return {}
+    session = await _get_yt_session()
+    try:
+        async with session.get(
+            f"{YOUTUBE_V3_BASE_URL}/videos",
+            params={
+                "part": "contentDetails",
+                "id": ",".join(video_ids[:50]),
+                "key": YOUTUBE_API_KEY,
+            },
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as response:
+            if response.status != 200:
+                _module_logger.warning(f"⚠️ YouTube V3 videos.list failed: HTTP {response.status}")
+                return {}
+            data = await response.json()
+    except Exception as e:
+        _module_logger.warning(f"⚠️ YouTube V3 videos.list error: {e}")
+        return {}
+
+    out: Dict[str, Optional[str]] = {}
+    for item in data.get("items", []):
+        vid = item.get("id")
+        iso = item.get("contentDetails", {}).get("duration")
+        out[vid] = _iso8601_duration_to_str(iso)
+    return out
+
+
+async def _youtube_v3_search(query: str, limit: int = 1) -> List[Dict]:
+    """Official YouTube Data v3 search.search + videos.list (for durations),
+    returned as a list of normalized dicts (see module docstring above)."""
+    if not query or not query.strip():
+        return []
+    if not YOUTUBE_API_KEY:
+        _module_logger.warning("⚠️ YOUTUBE_API_KEY is not set — YouTube search will return no results.")
+        return []
+
+    await _check_rate_limit_async()
+    session = await _get_yt_session()
+    try:
+        async with session.get(
+            f"{YOUTUBE_V3_BASE_URL}/search",
+            params={
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "maxResults": min(max(limit, 1), 50),
+                "key": YOUTUBE_API_KEY,
+            },
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as response:
+            if response.status != 200:
+                body = await response.text()
+                _module_logger.warning(f"⚠️ YouTube V3 search failed: HTTP {response.status} {body[:200]}")
+                return []
+            data = await response.json()
+    except Exception as e:
+        _module_logger.warning(f"⚠️ YouTube V3 search error: {e}")
+        return []
+
+    items = data.get("items", [])
+    if not items:
+        return []
+
+    video_ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
+    durations = await _youtube_v3_video_durations(video_ids)
+
+    results: List[Dict] = []
+    for it in items:
+        vid = it.get("id", {}).get("videoId")
+        if not vid:
+            continue
+        snippet = it.get("snippet", {})
+        thumbs = snippet.get("thumbnails", {})
+        thumb_url = (
+            thumbs.get("high", {}).get("url")
+            or thumbs.get("medium", {}).get("url")
+            or thumbs.get("default", {}).get("url")
+            or ""
+        )
+        results.append({
+            "id": vid,
+            "title": snippet.get("title", ""),
+            "duration": durations.get(vid),
+            "thumbnails": [{"url": thumb_url}],
+            "thumbnail": thumb_url,
+            "link": f"https://www.youtube.com/watch?v={vid}",
+            "channel": {"name": snippet.get("channelTitle", "")},
+        })
+    return results
+
+
 # ============ YOUTUBE API CLASS ============
 @capture_internal_err
 async def cached_youtube_search(query: str) -> List[Dict]:
@@ -872,8 +1006,7 @@ async def cached_youtube_search(query: str) -> List[Dict]:
         if len(_cache) > YOUTUBE_META_MAX:
             _cache.clear()
     try:
-        data = await VideosSearch(query, limit=1).next()
-        result = data.get("result", [])
+        result = await _youtube_v3_search(query, limit=1)
     except Exception:
         result = []
     if result:
@@ -890,8 +1023,7 @@ async def youtube_search_multi(query: str, limit: int = 8) -> List[Dict]:
     same #1 result. Results are NOT cached (we want variety across calls).
     """
     try:
-        data = await VideosSearch(query, limit=limit).next()
-        return data.get("result", [])
+        return await _youtube_v3_search(query, limit=limit)
     except Exception:
         return []
 
@@ -953,8 +1085,7 @@ class YouTubeAPI:
         if use_cache and not q.startswith("http"):
             res = await cached_youtube_search(q)
             return res[0] if res else None
-        data = await VideosSearch(q, limit=1).next()
-        result = data.get("result", [])
+        result = await _youtube_v3_search(q, limit=1)
         return result[0] if result else None
 
     @capture_internal_err
@@ -1182,8 +1313,7 @@ class YouTubeAPI:
 
     @capture_internal_err
     async def slider(self, link: str, query_type: int, videoid: Union[str, bool, None] = None) -> Tuple[str, Optional[str], str, str]:
-        data = await VideosSearch(self._prepare_link(link, videoid), limit=10).next()
-        results = data.get("result", [])
+        results = await _youtube_v3_search(self._prepare_link(link, videoid), limit=10)
         if not results or query_type >= len(results):
             raise IndexError(f"Query type index {query_type} out of range (found {len(results)} results)")
         r = results[query_type]
