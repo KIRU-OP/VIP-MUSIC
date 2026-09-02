@@ -40,7 +40,7 @@ SHRUTI_API_KEY = "ShrutiBotsPAVXJFsXdDeoJqDOe4NW"
 # Replaces the old youtubesearchpython scraper, which broke silently whenever
 # YouTube changed its page markup. Get a key from Google Cloud Console
 # (enable "YouTube Data API v3") and set it as an env var.
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyAuWd41xKkkd0HDq87dK9jHffW6lKzKWJs")
 YOUTUBE_V3_BASE_URL = "https://www.googleapis.com/youtube/v3"
 
 # API 1: Primary Shruti API (Direct Download)
