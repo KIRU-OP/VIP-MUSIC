@@ -20,16 +20,16 @@ import yt_dlp
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
 
-from RishuMusic.utils.cookie_handler import COOKIE_PATH
-from RishuMusic.utils.database import is_on_off
-from RishuMusic.utils.errors import capture_internal_err
-from RishuMusic.utils.formatters import time_to_seconds
-from RishuMusic.utils.tuning import (
+from VIPMUSIC.utils.cookie_handler import COOKIE_PATH
+from VIPMUSIC.utils.database import is_on_off
+from VIPMUSIC.utils.errors import capture_internal_err
+from VIPMUSIC.utils.formatters import time_to_seconds
+from VIPMUSIC.utils.tuning import (
     YTDLP_TIMEOUT,
     YOUTUBE_META_MAX,
     YOUTUBE_META_TTL,
 )
-from RishuMusic import LOGGER
+from VIPMUSIC import LOGGER
 
 _module_logger = LOGGER(__name__)
 
