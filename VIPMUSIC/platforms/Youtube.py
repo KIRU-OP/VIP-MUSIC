@@ -54,12 +54,12 @@ SHRUTI_API_KEY = "ShrutiBotsPAVXJFsXdDeoJqDOe4NW"
 # key the moment one hits quotaExceeded, so effective daily quota becomes
 # 10,000 × number of keys. Only once EVERY key is exhausted does it fall
 # back to the quota-free yt-dlp search (see _ytdlp_search_fallback below).
-_raw_keys = os.environ.get("YOUTUBE_API_KEYS", "AIzaSyCDpYRd4S4xBboTyfVZ1rYsDtgnHmOlqIA").strip()
+_raw_keys = os.environ.get("YOUTUBE_API_KEYS", "AIzaSyCDpYRd4S4xBboTyfVZ1rYsDtgnHmOlqIA, AIzaSyBT9ffbKLBhRQDr8WWt3IH4FcXqenFjoO0, AIzaSyB3Mf15uCZ3oqpWRRScj9jxDt0WUI0YYJc").strip()
 if _raw_keys:
     YOUTUBE_API_KEYS: List[str] = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 else:
     # Backward compatible: single-key env var (or the old hardcoded default).
-    YOUTUBE_API_KEYS = [os.environ.get("YOUTUBE_API_KEY", "AIzaSyAuWd41xKkkd0HDq87dK9jHffW6lKzKWJs")]
+    YOUTUBE_API_KEYS = [os.environ.get("YOUTUBE_API_KEY", "AIzaSyAuWd41xKkkd0HDq87dK9jHffW6lKzKWJs, AIzaSyBT9ffbKLBhRQDr8WWt3IH4FcXqenFjoO0, AIzaSyB3Mf15uCZ3oqpWRRScj9jxDt0WUI0YYJc")]
 YOUTUBE_V3_BASE_URL = "https://www.googleapis.com/youtube/v3"
 
 
