@@ -7,25 +7,29 @@ import time
 import aiofiles
 import aiohttp
 import shutil
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
+
+try:
+    from zoneinfo import ZoneInfo  # stdlib, Python 3.9+
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 
 import yt_dlp
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
-from youtubesearchpython.__future__ import VideosSearch
 
-from VIPMUSIC.utils.cookie_handler import COOKIE_PATH
-from VIPMUSIC.utils.database import is_on_off
-from VIPMUSIC.utils.downloader import yt_dlp_download
-from VIPMUSIC.utils.errors import capture_internal_err
-from VIPMUSIC.utils.formatters import time_to_seconds
-from VIPMUSIC.utils.tuning import (
+from RishuMusic.utils.cookie_handler import COOKIE_PATH
+from RishuMusic.utils.database import is_on_off
+from RishuMusic.utils.errors import capture_internal_err
+from RishuMusic.utils.formatters import time_to_seconds
+from RishuMusic.utils.tuning import (
     YTDLP_TIMEOUT,
     YOUTUBE_META_MAX,
     YOUTUBE_META_TTL,
 )
-from VIPMUSIC import LOGGER
+from RishuMusic import LOGGER
 
 _module_logger = LOGGER(__name__)
 
@@ -36,6 +40,46 @@ _formats_lock = asyncio.Lock()
 
 # ============ API CONFIGURATION ============
 SHRUTI_API_KEY = "ShrutiBotsPAVXJFsXdDeoJqDOe4NW"
+
+# YouTube Data API v3 (official) — used for all search/metadata lookups.
+# Replaces the old youtubesearchpython scraper, which broke silently whenever
+# YouTube changed its page markup. Get a key from Google Cloud Console
+# (enable "YouTube Data API v3") and set it as an env var.
+#
+# QUOTA NOTE: the free tier gives each key only 10,000 units/day (a search
+# call costs ~100 units), so one key alone runs out fast under real traffic.
+# To survive 24/7, set MULTIPLE keys as a comma-separated list in
+# YOUTUBE_API_KEYS (e.g. "key1,key2,key3" — create each free in a separate
+# Google Cloud project). The pool below automatically rotates to the next
+# key the moment one hits quotaExceeded, so effective daily quota becomes
+# 10,000 × number of keys. Only once EVERY key is exhausted does it fall
+# back to the quota-free yt-dlp search (see _ytdlp_search_fallback below).
+_raw_keys = os.environ.get("YOUTUBE_API_KEYS", "AIzaSyCDpYRd4S4xBboTyfVZ1rYsDtgnHmOlqIA").strip()
+if _raw_keys:
+    YOUTUBE_API_KEYS: List[str] = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+else:
+    # Backward compatible: single-key env var (or the old hardcoded default).
+    YOUTUBE_API_KEYS = [os.environ.get("YOUTUBE_API_KEY", "AIzaSyAuWd41xKkkd0HDq87dK9jHffW6lKzKWJs")]
+YOUTUBE_V3_BASE_URL = "https://www.googleapis.com/youtube/v3"
+
+
+def _mask_key(key: Optional[str]) -> str:
+    """Never print the full API key to logs — only enough to tell keys apart.
+    Defined up here (rather than further down, where it originally lived)
+    because load_apis() below can run synchronously at import time — before
+    later module-level definitions would otherwise exist — and now calls
+    this for its startup log line."""
+    if not key:
+        return "<empty>"
+    if len(key) <= 8:
+        return "***"
+    return f"{key[:4]}...{key[-4:]} (len={len(key)})"
+
+# Per-key quota-exhaustion cooldown (epoch seconds; each key resets independently
+# at midnight Pacific) + a round-robin pointer into YOUTUBE_API_KEYS.
+_key_exhausted_until: Dict[str, float] = {}
+_current_key_idx = 0
+_key_rotation_lock = asyncio.Lock()
 
 # API 1: Primary Shruti API (Direct Download)
 PRIMARY_API_URL = "https://api.shrutibots.site"
@@ -295,6 +339,14 @@ async def load_apis():
     """Load and verify APIs - only checks non-empty URLs."""
     global PRIMARY_API_LOADED, FALLBACK_API_LOADED, WORKER_FALLBACK_API_LOADED
     logger = LOGGER("VISHALMUSIC.platforms.Youtube.py")
+
+    # Log key-pool size on startup so "search stopped working" is easy to
+    # diagnose from logs alone (e.g. only 1 key configured -> quota runs out
+    # fast; env var not read at all -> falls back to the hardcoded default).
+    logger.info(
+        f"[INFO] YouTube Data API v3 key pool: {len(YOUTUBE_API_KEYS)} key(s) configured "
+        f"({', '.join(_mask_key(k) for k in YOUTUBE_API_KEYS)})"
+    )
 
     if PRIMARY_API_URL:
         try:
@@ -716,7 +768,10 @@ async def download_audio_ytdlp(link: str) -> str:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.webm")
 
-    if os.path.exists(file_path):
+    # BUG FIX: this cache check had no size guard (unlike every other cache
+    # check in the file), so a corrupt/empty leftover file from a previous
+    # failed download would be returned as a "successful" result forever.
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 10240:
         return file_path
 
     await _check_rate_limit_async()
@@ -858,6 +913,530 @@ async def download_video(link: str) -> str:
     return None
 
 
+# ============ AUDIO: DIRECT STREAM URL ONLY (NO DISK DOWNLOAD) ============
+# Per requirement: audio should never be downloaded to disk anymore — the
+# player should always receive a direct, playable stream link. This is a
+# small ordered chain of "stream URL providers"; each one either returns a
+# ready-to-play URL or None. The first one that works wins.
+#
+# To add a brand new API later:
+#   1. Write `async def _stream_url_newapi(link: str) -> Optional[str]: ...`
+#      following the same shape as the ones below.
+#   2. Append it to AUDIO_STREAM_SOURCES.
+# Nothing else in the file needs to change.
+
+async def _validate_stream_url(url: str, timeout: float = 6.0) -> bool:
+    """
+    Quick liveness check for a candidate stream URL before handing it to the
+    player. Uses a tiny ranged GET (some CDNs ignore/block HEAD) so it never
+    downloads the actual file — it only confirms the endpoint is alive and
+    responds with a success status. Keeps the whole chain fast-failing so a
+    dead API doesn't stall playback.
+    """
+    try:
+        session = await _get_yt_session()
+        headers = {"Range": "bytes=0-1"}
+        async with session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as resp:
+            return resp.status in (200, 206)
+    except Exception:
+        return False
+
+
+async def _stream_url_ytdlp(link: str) -> Optional[str]:
+    """Direct googlevideo/CDN stream URL via `yt-dlp -g` — no file written."""
+    await _check_rate_limit_async()
+    ytdlp_args = [
+        "yt-dlp", *(_yt_dlp_cli_args()), "--no-warnings", "--geo-bypass", "--force-ipv4",
+        "-g", "-f", "bestaudio/best", link,
+    ]
+    stdout, stderr = await _exec_proc(*ytdlp_args)
+    if stdout:
+        url = stdout.decode().split("\n")[0].strip()
+        if url.startswith("http"):
+            return url
+    error_msg = stderr.decode() if stderr else ""
+    if _is_bot_check_error(error_msg):
+        _module_logger.info(
+            "❌ Stream (yt-dlp): YouTube bot-check triggered — cookies missing/expired."
+        )
+    elif "429" in error_msg or "Too Many Requests" in error_msg:
+        _module_logger.info("❌ Stream (yt-dlp): rate limited (429).")
+    return None
+
+
+async def _stream_url_primary_api(link: str) -> Optional[str]:
+    """
+    Primary Shruti API's own endpoint used directly as the stream URL — the
+    player pulls straight from the API's CDN instead of us downloading first.
+    Only validated (ranged GET), never fully fetched here.
+    """
+    if not PRIMARY_API_URL:
+        return None
+    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
+    if not video_id or len(video_id) < 3:
+        return None
+    url = f"{PRIMARY_API_URL}/download?url={video_id}&type=audio&api_key={SHRUTI_API_KEY}"
+    return url if await _validate_stream_url(url) else None
+
+
+async def _stream_url_worker_api(link: str) -> Optional[str]:
+    """Worker (Cloudflare) fallback API's endpoint used directly as a stream URL."""
+    if not WORKER_FALLBACK_API_URL:
+        return None
+    video_id = link.split('v=')[-1].split('&')[0] if 'v=' in link else link
+    if not video_id or len(video_id) < 3:
+        return None
+    url = f"{WORKER_FALLBACK_API_URL}/download?url={video_id}&type=audio&key={WORKER_FALLBACK_API_KEY}"
+    return url if await _validate_stream_url(url) else None
+
+
+# NOTE: the token-based Fallback API (FALLBACK_API_URL) is intentionally left
+# out of this chain — it requires a custom `X-Download-Token` header, which a
+# plain stream URL can't carry, so it can't be handed to a player as-is.
+AUDIO_STREAM_SOURCES = [
+    _stream_url_ytdlp,
+    _stream_url_primary_api,
+    _stream_url_worker_api,
+]
+
+
+async def get_audio_stream_url(link: str) -> Optional[str]:
+    """
+    Tries each configured source in AUDIO_STREAM_SOURCES in order and returns
+    the first working direct stream URL. No audio file is ever written to
+    disk. If every source is down, returns None.
+    """
+    for source in AUDIO_STREAM_SOURCES:
+        try:
+            url = await source(link)
+        except Exception as e:
+            _module_logger.info(f"❌ Stream source '{source.__name__}' errored: {e}")
+            continue
+        if url:
+            _module_logger.info(f"✅ Audio stream URL via {source.__name__}")
+            return url
+    return None
+
+
+# ============ YOUTUBE DATA API v3 (SEARCH) ============
+# Normalizes results into the same shape youtubesearchpython used to return
+# ({"id", "title", "duration", "thumbnails": [{"url": ...}], "link", "channel"})
+# so every existing consumer below (title/duration/thumbnail/details/track/
+# slider) keeps working unchanged.
+
+_ISO8601_DUR_RE = re.compile(
+    r"^P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?$"
+)
+
+
+def _iso8601_duration_to_str(iso: Optional[str]) -> Optional[str]:
+    """Convert YouTube's 'PT#H#M#S' duration into 'M:SS' / 'H:MM:SS' text,
+    matching youtubesearchpython's old string format. Live streams report
+    durations like 'P0D' (no time component) -> treated as None, same as
+    youtubesearchpython did for ongoing livestreams."""
+    if not iso:
+        return None
+    m = _ISO8601_DUR_RE.match(iso)
+    if not m:
+        return None
+    days = int(m.group("days") or 0)
+    hours = int(m.group("hours") or 0) + days * 24
+    minutes = int(m.group("minutes") or 0)
+    seconds = int(m.group("seconds") or 0)
+    total = hours * 3600 + minutes * 60 + seconds
+    if total <= 0:
+        return None
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _log_v3_error_body(context: str, status: int, body: str, key: Optional[str] = None) -> Optional[str]:
+    """
+    Parses the standard Google API error JSON and logs the REAL reason
+    (quota exceeded, key invalid, API not enabled, referrer blocked, etc.)
+    instead of just the raw HTTP status, which is what actually matters
+    when V3 API calls stop working. Returns the parsed `reason` string
+    (e.g. 'quotaExceeded') so callers can react to it programmatically —
+    used to trigger key rotation / the yt-dlp search fallback below.
+    """
+    reason = None
+    message = None
+    try:
+        parsed = json.loads(body)
+        err = parsed.get("error", {})
+        message = err.get("message")
+        errors_list = err.get("errors") or []
+        if errors_list:
+            reason = errors_list[0].get("reason")
+        reason = reason or err.get("status")
+    except Exception:
+        pass
+
+    if status == 403:
+        if reason == "quotaExceeded":
+            hint = (
+                "reason='quotaExceeded' -> this key's daily YouTube Data API v3 quota "
+                "(10,000 units/day on the default free tier) is used up; "
+                "it resets at midnight Pacific time. Rotating to next key if available. "
+            )
+        elif reason in ("keyInvalid", "accessNotConfigured", "forbidden"):
+            hint = (
+                "-> check the API key is correct, that 'YouTube Data API v3' is ENABLED "
+                "for this project in Google Cloud Console, and that any API-key "
+                "restrictions (HTTP referrer / IP / API restrictions) allow this server. "
+            )
+        else:
+            hint = ""
+    elif status == 400:
+        hint = "reason='badRequest' -> malformed request (bad key format or bad params). "
+    elif status == 429:
+        hint = "-> rate limited by Google, back off. "
+    else:
+        hint = ""
+
+    _module_logger.error(
+        f"❌ YouTube V3 {context} failed: HTTP {status} reason={reason} "
+        f"message={message!r} key={_mask_key(key)} | {hint}raw={body[:500]}"
+    )
+    return reason
+
+
+
+# ── YouTube V3 quota-exhaustion tracking + multi-key rotation + automatic
+#    yt-dlp search fallback ─────────────────────────────────────────────────
+# Once Google returns reason='quotaExceeded' for a key, every further call
+# with THAT key would just fail the same way until midnight Pacific. Instead
+# of hammering Google with doomed requests:
+#   1. Mark only that one key exhausted (with its own reset time) and rotate
+#      to the next key in YOUTUBE_API_KEYS — so a single key running out
+#      doesn't stop the bot.
+#   2. Only once EVERY key in the pool is simultaneously exhausted do we shift
+#      to the quota-free yt-dlp search fallback, until the earliest key resets.
+_V3_QUOTA_EXCEEDED_UNTIL = 0.0  # epoch seconds; 0 = at least one key believed OK
+
+
+def _seconds_until_pt_midnight() -> float:
+    """How many seconds until the next YouTube API quota reset (midnight
+    Pacific time). Falls back to a flat 1-hour retry if timezone data isn't
+    available, so we still recover instead of being stuck forever."""
+    if ZoneInfo is None:
+        return 3600.0
+    try:
+        tz = ZoneInfo("America/Los_Angeles")
+        now = datetime.now(tz)
+        next_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return max((next_midnight - now).total_seconds(), 60.0)
+    except Exception:
+        return 3600.0
+
+
+async def _get_active_api_key() -> Optional[str]:
+    """
+    Returns the next YouTube API key that isn't currently marked
+    quota-exhausted, rotating round-robin through YOUTUBE_API_KEYS. Returns
+    None only when every single key in the pool is exhausted right now —
+    that's the signal to use the yt-dlp fallback instead.
+    """
+    global _current_key_idx
+    if not YOUTUBE_API_KEYS:
+        return None
+    now = time.time()
+    async with _key_rotation_lock:
+        n = len(YOUTUBE_API_KEYS)
+        for step in range(n):
+            idx = (_current_key_idx + step) % n
+            key = YOUTUBE_API_KEYS[idx]
+            if now >= _key_exhausted_until.get(key, 0.0):
+                _current_key_idx = idx
+                return key
+    return None  # every key in the pool is currently exhausted
+
+
+async def _mark_key_quota_exceeded(key: str) -> None:
+    """Marks ONE key exhausted until midnight PT and rotates to the next one.
+    Only sets the global all-keys-exhausted fallback flag once no key in the
+    pool is usable anymore."""
+    global _current_key_idx, _V3_QUOTA_EXCEEDED_UNTIL
+    reset_at = time.time() + _seconds_until_pt_midnight()
+    async with _key_rotation_lock:
+        _key_exhausted_until[key] = reset_at
+        _current_key_idx = (_current_key_idx + 1) % len(YOUTUBE_API_KEYS)
+        remaining = [k for k in YOUTUBE_API_KEYS if time.time() >= _key_exhausted_until.get(k, 0.0)]
+
+    if remaining:
+        _module_logger.warning(
+            f"⏭️ YouTube V3 key {_mask_key(key)} quota exhausted — rotating to another "
+            f"key ({len(remaining)}/{len(YOUTUBE_API_KEYS)} keys still available)."
+        )
+    else:
+        _V3_QUOTA_EXCEEDED_UNTIL = min(_key_exhausted_until.values())
+        _module_logger.warning(
+            f"⏭️ ALL {len(YOUTUBE_API_KEYS)} YouTube V3 key(s) quota exhausted — shifting "
+            f"all search to the yt-dlp fallback for ~"
+            f"{(_V3_QUOTA_EXCEEDED_UNTIL - time.time()) / 3600:.1f}h (until the earliest "
+            f"key resets at midnight Pacific)."
+        )
+
+
+
+async def _ytdlp_search_fallback(query: str, limit: int = 1) -> List[Dict]:
+    """
+    Fallback search used whenever YouTube Data API v3 is unavailable — quota
+    exhausted, key invalid/missing, network error, timeout, etc. Uses
+    yt-dlp's built-in `ytsearch` (no API key / quota needed) so search keeps
+    working uninterrupted. Runs the blocking yt-dlp extraction in a thread
+    executor. Returns results normalized to the exact same shape as
+    _youtube_v3_search so every downstream consumer keeps working unchanged.
+    """
+    if not query or not query.strip():
+        return []
+    n = min(max(limit, 1), 20)
+
+    def _extract():
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": "in_playlist",
+            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
+        }
+        cf = _cookiefile_path()
+        if cf:
+            opts["cookiefile"] = cf
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+            return (info or {}).get("entries", []) or []
+
+    try:
+        entries = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _extract), timeout=20
+        )
+    except Exception as e:
+        _module_logger.error(f"❌ yt-dlp search fallback failed: {type(e).__name__}: {e} | q={query!r}")
+        return []
+
+    results: List[Dict] = []
+    for e in entries:
+        if not e:
+            continue
+        vid = e.get("id")
+        if not vid:
+            continue
+        dur_sec = e.get("duration")
+        duration_str = None
+        if dur_sec:
+            dur_sec = int(dur_sec)
+            hours, rem = divmod(dur_sec, 3600)
+            minutes, seconds = divmod(rem, 60)
+            duration_str = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+        thumbs = e.get("thumbnails") or []
+        thumb_url = thumbs[-1].get("url", "") if thumbs else ""
+        results.append({
+            "id": vid,
+            "title": e.get("title", ""),
+            "duration": duration_str,
+            "thumbnails": [{"url": thumb_url}],
+            "thumbnail": thumb_url,
+            "link": f"https://www.youtube.com/watch?v={vid}",
+            "channel": {"name": e.get("channel") or e.get("uploader") or ""},
+        })
+
+    if results:
+        _module_logger.info(f"✅ yt-dlp search fallback OK — {len(results)} item(s) for q={query!r}")
+    else:
+        _module_logger.warning(f"⚠️ yt-dlp search fallback: 0 results for q={query!r}")
+    return results
+
+
+async def _youtube_v3_video_durations(video_ids: List[str]) -> Dict[str, Optional[str]]:
+    """Batch-fetch contentDetails.duration for up to 50 video IDs in one call.
+
+    BUG FIX: this used to try exactly one key and give up on ANY failure
+    (invalid key, transient error, etc.) without ever trying the rest of the
+    key pool — unlike _youtube_v3_search, which does rotate. It now rotates
+    through every configured key the same way search does, so a single bad
+    key here no longer silently kills durations for every search result."""
+    if not video_ids:
+        return {}
+    session = await _get_yt_session()
+    global _current_key_idx
+
+    for attempt in range(max(len(YOUTUBE_API_KEYS), 1)):
+        api_key = await _get_active_api_key()
+        if not api_key:
+            _module_logger.error("❌ YouTube V3 videos.list skipped: no non-exhausted API key available.")
+            return {}
+        try:
+            async with session.get(
+                f"{YOUTUBE_V3_BASE_URL}/videos",
+                params={
+                    "part": "contentDetails",
+                    "id": ",".join(video_ids[:50]),
+                    "key": api_key,
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    reason = _log_v3_error_body("videos.list", response.status, body, key=api_key)
+                    if reason == "quotaExceeded":
+                        await _mark_key_quota_exceeded(api_key)
+                    else:
+                        async with _key_rotation_lock:
+                            _current_key_idx = (_current_key_idx + 1) % len(YOUTUBE_API_KEYS)
+                        _module_logger.warning(
+                            f"↩️ Key {_mask_key(api_key)} failed on videos.list (reason={reason}) — trying next key."
+                        )
+                    continue
+                data = await response.json()
+                break
+        except asyncio.TimeoutError:
+            _module_logger.error("❌ YouTube V3 videos.list error: request timed out after 10s.")
+            return {}
+        except aiohttp.ClientError as e:
+            _module_logger.error(f"❌ YouTube V3 videos.list network error: {type(e).__name__}: {e}")
+            return {}
+        except Exception as e:
+            _module_logger.error(f"❌ YouTube V3 videos.list unexpected error: {type(e).__name__}: {e}")
+            return {}
+    else:
+        _module_logger.warning("↩️ All keys failed on videos.list — returning no durations for this batch.")
+        return {}
+
+    out: Dict[str, Optional[str]] = {}
+    for item in data.get("items", []):
+        vid = item.get("id")
+        iso = item.get("contentDetails", {}).get("duration")
+        out[vid] = _iso8601_duration_to_str(iso)
+    _module_logger.info(f"✅ YouTube V3 videos.list OK — {len(out)}/{len(video_ids)} durations fetched.")
+    return out
+
+
+async def _youtube_v3_search(query: str, limit: int = 1) -> List[Dict]:
+    """Official YouTube Data v3 search.search + videos.list (for durations),
+    returned as a list of normalized dicts (see module docstring above).
+
+    Rotates through every key in YOUTUBE_API_KEYS before giving up, and only
+    once ALL keys are exhausted (or missing) does it shift to
+    _ytdlp_search_fallback() — so search never just stops working. Callers
+    don't need to know or care which key/backend actually served the result."""
+    global _current_key_idx
+    if not query or not query.strip():
+        return []
+
+    now = time.time()
+    if now < _V3_QUOTA_EXCEEDED_UNTIL:
+        remaining_h = (_V3_QUOTA_EXCEEDED_UNTIL - now) / 3600
+        _module_logger.info(
+            f"⏭️ All YouTube V3 keys still exhausted (~{remaining_h:.1f}h until earliest "
+            f"reset) — using yt-dlp search fallback directly. q={query!r}"
+        )
+        return await _ytdlp_search_fallback(query, limit)
+
+    await _check_rate_limit_async()
+    session = await _get_yt_session()
+
+    for attempt in range(max(len(YOUTUBE_API_KEYS), 1)):
+        api_key = await _get_active_api_key()
+        if not api_key:
+            _module_logger.error(
+                "❌ YouTube V3 search: no non-exhausted API key available. "
+                "Shifting to yt-dlp search fallback."
+            )
+            return await _ytdlp_search_fallback(query, limit)
+
+        _module_logger.info(
+            f"🔎 YouTube V3 search: q={query!r} limit={limit} key={_mask_key(api_key)} "
+            f"(attempt {attempt + 1}/{len(YOUTUBE_API_KEYS)})"
+        )
+        try:
+            async with session.get(
+                f"{YOUTUBE_V3_BASE_URL}/search",
+                params={
+                    "part": "snippet",
+                    "q": query,
+                    "type": "video",
+                    "maxResults": min(max(limit, 1), 50),
+                    "key": api_key,
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    reason = _log_v3_error_body("search.search", response.status, body, key=api_key)
+                    if reason == "quotaExceeded":
+                        await _mark_key_quota_exceeded(api_key)
+                    else:
+                        # BUG FIX: previously any non-quota error (invalid key,
+                        # accessNotConfigured, a transient 5xx from Google,
+                        # etc.) gave up on the ENTIRE key pool immediately and
+                        # fell back to yt-dlp — even if other configured keys
+                        # were perfectly fine. Now we just rotate past this
+                        # one bad key and keep trying the rest of the pool.
+                        async with _key_rotation_lock:
+                            _current_key_idx = (_current_key_idx + 1) % len(YOUTUBE_API_KEYS)
+                        _module_logger.warning(
+                            f"↩️ Key {_mask_key(api_key)} failed (reason={reason}) — "
+                            f"trying next key in the pool instead of giving up."
+                        )
+                    continue  # try the next key in the pool right away
+                data = await response.json()
+                break
+        except asyncio.TimeoutError:
+            _module_logger.error(f"❌ YouTube V3 search error: request timed out after 10s. q={query!r}")
+            return await _ytdlp_search_fallback(query, limit)
+        except aiohttp.ClientError as e:
+            _module_logger.error(f"❌ YouTube V3 search network error: {type(e).__name__}: {e} | q={query!r}")
+            return await _ytdlp_search_fallback(query, limit)
+        except Exception as e:
+            _module_logger.error(f"❌ YouTube V3 search unexpected error: {type(e).__name__}: {e} | q={query!r}")
+            return await _ytdlp_search_fallback(query, limit)
+    else:
+        # Every key in the pool failed during this loop (quota or otherwise).
+        _module_logger.warning(f"↩️ All keys failed — shifting to yt-dlp search fallback for q={query!r}")
+        return await _ytdlp_search_fallback(query, limit)
+
+    items = data.get("items", [])
+    if not items:
+        # A genuine "no results" from a healthy API call — not a failure, so
+        # no fallback needed here (the fallback wouldn't find anything either).
+        _module_logger.warning(f"⚠️ YouTube V3 search: 0 items returned for q={query!r} (not an error, just no results).")
+        return []
+    _module_logger.info(f"✅ YouTube V3 search OK — {len(items)} item(s) for q={query!r}")
+
+    video_ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
+    durations = await _youtube_v3_video_durations(video_ids)
+
+    results: List[Dict] = []
+    for it in items:
+        vid = it.get("id", {}).get("videoId")
+        if not vid:
+            continue
+        snippet = it.get("snippet", {})
+        thumbs = snippet.get("thumbnails", {})
+        thumb_url = (
+            thumbs.get("high", {}).get("url")
+            or thumbs.get("medium", {}).get("url")
+            or thumbs.get("default", {}).get("url")
+            or ""
+        )
+        results.append({
+            "id": vid,
+            "title": snippet.get("title", ""),
+            "duration": durations.get(vid),
+            "thumbnails": [{"url": thumb_url}],
+            "thumbnail": thumb_url,
+            "link": f"https://www.youtube.com/watch?v={vid}",
+            "channel": {"name": snippet.get("channelTitle", "")},
+        })
+    return results
+
+
 # ============ YOUTUBE API CLASS ============
 @capture_internal_err
 async def cached_youtube_search(query: str) -> List[Dict]:
@@ -872,8 +1451,7 @@ async def cached_youtube_search(query: str) -> List[Dict]:
         if len(_cache) > YOUTUBE_META_MAX:
             _cache.clear()
     try:
-        data = await VideosSearch(query, limit=1).next()
-        result = data.get("result", [])
+        result = await _youtube_v3_search(query, limit=1)
     except Exception:
         result = []
     if result:
@@ -890,8 +1468,7 @@ async def youtube_search_multi(query: str, limit: int = 8) -> List[Dict]:
     same #1 result. Results are NOT cached (we want variety across calls).
     """
     try:
-        data = await VideosSearch(query, limit=limit).next()
-        return data.get("result", [])
+        return await _youtube_v3_search(query, limit=limit)
     except Exception:
         return []
 
@@ -953,8 +1530,7 @@ class YouTubeAPI:
         if use_cache and not q.startswith("http"):
             res = await cached_youtube_search(q)
             return res[0] if res else None
-        data = await VideosSearch(q, limit=1).next()
-        result = data.get("result", [])
+        result = await _youtube_v3_search(q, limit=1)
         return result[0] if result else None
 
     @capture_internal_err
@@ -1039,39 +1615,6 @@ class YouTubeAPI:
                 return await self._try_alternative_format(link)
             else:
                 return (0, error_msg)
-
-    async def _get_audio_stream_url(self, link: str) -> Optional[str]:
-        """
-        Last-resort audio fallback: ask yt-dlp for a direct playable stream URL
-        (no file written to disk) instead of downloading. Used when the Shruti
-        APIs are down AND every file-download method (primary/fallback API,
-        yt-dlp, concurrent downloader) has failed. Mirrors what video() already
-        does for video streams.
-        """
-        await _check_rate_limit_async()
-        ytdlp_args = [
-            "yt-dlp", *(_yt_dlp_cli_args()), "--no-warnings", "--geo-bypass", "--force-ipv4",
-            "-g", "-f", "bestaudio/best", link
-        ]
-        stdout, stderr = await _exec_proc(*ytdlp_args)
-
-        if stdout:
-            stream_url = stdout.decode().split("\n")[0]
-            if stream_url and stream_url.startswith("http"):
-                return stream_url
-            return None
-
-        error_msg = stderr.decode() if stderr else "Unknown error"
-        if _is_bot_check_error(error_msg):
-            _module_logger.info(
-                "❌ Audio stream fallback: YouTube bot-check triggered — cookies are "
-                "missing/expired. Export fresh cookies and update COOKIE_PATH."
-            )
-        elif "429" in error_msg or "Too Many Requests" in error_msg:
-            _module_logger.info("❌ Audio stream fallback: rate limited (429).")
-        else:
-            _module_logger.info(f"❌ Audio stream fallback failed: {error_msg.strip()[:300]}")
-        return None
 
     async def _try_alternative_format(self, link: str) -> Tuple[int, str]:
         format_options = ["best[height<=480]", "best[ext=mp4]", "best", "worst"]
@@ -1182,8 +1725,7 @@ class YouTubeAPI:
 
     @capture_internal_err
     async def slider(self, link: str, query_type: int, videoid: Union[str, bool, None] = None) -> Tuple[str, Optional[str], str, str]:
-        data = await VideosSearch(self._prepare_link(link, videoid), limit=10).next()
-        results = data.get("result", [])
+        results = await _youtube_v3_search(self._prepare_link(link, videoid), limit=10)
         if not results or query_type >= len(results):
             raise IndexError(f"Query type index {query_type} out of range (found {len(results)} results)")
         r = results[query_type]
@@ -1240,64 +1782,18 @@ class YouTubeAPI:
                 return None, None
 
         else:
-            # ── LIGHTNING FAST: Race download methods concurrently ──
-            # NOTE: _try_ytdlp and a former "_try_concurrent" both called the
-            # exact same yt_dlp_download() against the exact same output path
-            # (downloads/{video_id}.webm). Running that twice in parallel made
-            # two yt-dlp processes write to the same .webm.part file at once,
-            # so whichever process finished second couldn't find its .part
-            # file anymore (already renamed by the first) and crashed with
-            # "Unable to rename file: No such file or directory". Racing the
-            # same download method against itself never added a real chance
-            # of success anyway, so the duplicate task has been removed.
-            async def _try_primary():
-                return await download_audio(link)
-
-            async def _try_ytdlp():
-                return await yt_dlp_download(link, type="audio")
-
-            # Race: first successful result wins
-            task_map = {
-                asyncio.create_task(_try_primary()): "primary/fallback API + yt-dlp",
-                asyncio.create_task(_try_ytdlp()): "yt_dlp_download",
-            }
-            tasks = list(task_map.keys())
-
-            audio_result = None
-            for coro in asyncio.as_completed(tasks):
-                try:
-                    result = await coro
-                    if result and os.path.exists(result) and os.path.getsize(result) > 10240:
-                        audio_result = result
-                        # Cancel remaining tasks
-                        for t in tasks:
-                            t.cancel()
-                        break
-                except Exception as e:
-                    _module_logger.info(f"❌ Audio race method '{task_map.get(coro, '?')}' failed: {e}")
-                    continue
-
-            if audio_result:
-                _module_logger.info("✅ Audio downloaded (race winner)")
-                if audio_result != common_file_path:
-                    try:
-                        shutil.move(audio_result, common_file_path)
-                        return common_file_path, True
-                    except Exception:
-                        return audio_result, True
-                return audio_result, True
-
-            # ── LAST RESORT: every file-download method failed (e.g. both custom
-            # APIs down). Instead of giving up, ask yt-dlp for a direct playable
-            # stream URL — no file needed, so this works even with zero disk space
-            # or when the download APIs are unreachable. ──
-            _module_logger.info("⚠️ All audio download methods failed — trying direct stream URL fallback...")
-            stream_url = await self._get_audio_stream_url(link)
+            # ── AUDIO: STREAM ONLY, NEVER DOWNLOADED TO DISK ──
+            # No file is written for audio anymore. get_audio_stream_url() walks
+            # AUDIO_STREAM_SOURCES (yt-dlp -g -> Primary API URL -> Worker API
+            # URL, in that order) and returns the first live, playable link.
+            # Returning (url, None) matches the existing convention: `True`
+            # means "local file path", `None` means "remote stream URL".
+            stream_url = await get_audio_stream_url(link)
             if stream_url:
-                _module_logger.info("✅ Audio: direct stream URL fallback succeeded")
+                _module_logger.info("✅ Audio stream URL ready (no download)")
                 return stream_url, None
 
-            _module_logger.info("❌ All audio download methods AND stream fallback failed")
+            _module_logger.info("❌ All audio stream sources failed")
             return None, None
 
 YouTube = YouTubeAPI()
