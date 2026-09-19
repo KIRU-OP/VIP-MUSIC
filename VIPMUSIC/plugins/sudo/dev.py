@@ -138,13 +138,44 @@ async def forceclose_command(_, CallbackQuery):
             return await CallbackQuery.answer(
                 "» ɪᴛ'ʟʟ ʙᴇ ʙᴇᴛᴛᴇʀ ɪғ ʏᴏᴜ sᴛᴀʏ ɪɴ ʏᴏᴜʀ ʟɪᴍɪᴛs ʙᴀʙʏ.", show_alert=True
             )
-        except:
+        except Exception:
             return
     await CallbackQuery.message.delete()
     try:
         await CallbackQuery.answer()
-    except:
+    except Exception:
         return
+
+
+def _split_shell(text: str):
+    """Split a shell command respecting quoted substrings."""
+    parts = re.split(""" (?=(?:[^'"]|'[^']*'|"[^"]*")*$)""", text)
+    return [p.replace('"', "").replace("'", "") for p in parts if p != ""]
+
+
+def _run_shell(parts, timeout: int = 120):
+    """
+    Run a shell command safely with a timeout and return (ok, output).
+    Uses communicate() instead of a blocking .read() to avoid hanging
+    the whole bot if a command produces no output or waits on stdin.
+    """
+    try:
+        process = subprocess.Popen(
+            parts,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception as err:
+        return False, str(err)
+    try:
+        out, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        out, _ = process.communicate()
+        return False, "⏱ Command timed out after {}s.\n{}".format(
+            timeout, out.decode("utf-8", errors="ignore")
+        )
+    return True, out.decode("utf-8", errors="ignore").rstrip("\n")
 
 
 @app.on_edited_message(
@@ -154,50 +185,37 @@ async def forceclose_command(_, CallbackQuery):
 async def shellrunner(_, message: Message):
     if len(message.command) < 2:
         return await edit_or_reply(message, text="<b>ᴇxᴀᴍᴩʟᴇ :</b>\n/sh git pull")
+
     text = message.text.split(None, 1)[1]
+    output = ""
+
     if "\n" in text:
-        code = text.split("\n")
-        output = ""
-        for x in code:
-            shell = re.split(""" (?=(?:[^'"]|'[^']*'|"[^"]*")*$)""", x)
-            try:
-                process = subprocess.Popen(
-                    shell,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-            except Exception as err:
-                await edit_or_reply(message, text=f"<b>ERROR :</b>\n<pre>{err}</pre>")
-            output += f"<b>{code}</b>\n"
-            output += process.stdout.read()[:-1].decode("utf-8")
-            output += "\n"
+        lines = text.split("\n")
+        for line in lines:
+            if not line.strip():
+                continue
+            parts = _split_shell(line)
+            ok, result = _run_shell(parts)
+            output += f"<b>{line}</b>\n"
+            if not ok:
+                output += f"ERROR: {result}\n"
+                break
+            output += f"{result}\n"
     else:
-        shell = re.split(""" (?=(?:[^'"]|'[^']*'|"[^"]*")*$)""", text)
-        for a in range(len(shell)):
-            shell[a] = shell[a].replace('"', "")
-        try:
-            process = subprocess.Popen(
-                shell,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as err:
-            print(err)
-            exc_type, exc_obj, exc_tb = sys.exc_info()
-            errors = traceback.format_exception(
-                etype=exc_type,
-                value=exc_obj,
-                tb=exc_tb,
-            )
+        parts = _split_shell(text)
+        ok, result = _run_shell(parts)
+        if not ok:
             return await edit_or_reply(
-                message, text=f"<b>ERROR :</b>\n<pre>{''.join(errors)}</pre>"
+                message, text=f"<b>ERROR :</b>\n<pre>{result}</pre>"
             )
-        output = process.stdout.read()[:-1].decode("utf-8")
-    if str(output) == "\n":
+        output = result
+
+    if output.strip() in ("", "\n"):
         output = None
+
     if output:
         if len(output) > 4096:
-            with open("output.txt", "w+") as file:
+            with open("output.txt", "w+", encoding="utf-8") as file:
                 file.write(output)
             await app.send_document(
                 message.chat.id,
@@ -205,8 +223,9 @@ async def shellrunner(_, message: Message):
                 reply_to_message_id=message.id,
                 caption="<code>Output</code>",
             )
-            return os.remove("output.txt")
-        await edit_or_reply(message, text=f"<b>OUTPUT :</b>\n<pre>{output}</pre>")
+            os.remove("output.txt")
+        else:
+            await edit_or_reply(message, text=f"<b>OUTPUT :</b>\n<pre>{output}</pre>")
     else:
         await edit_or_reply(message, text="<b>OUTPUT :</b>\n<code>None</code>")
 
