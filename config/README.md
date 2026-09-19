@@ -1,6 +1,6 @@
 # VIP Music Bot Configs
 
-![VIP Music Bot](https://your-image-link-here.com/image.png)
+![VIP Music Bot](https://i.ibb.co/ksDJbShx/file-222.jpg)
 
 > Last Updated: 2026
 
