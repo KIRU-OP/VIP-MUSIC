@@ -1,26 +1,15 @@
-#
-# Copyright (C) 2021-2022 by KIRU-OP@Github, < https://github.com/KIRU-OP >.
-#
-# This file is part of < https://github.com/KIRU-OP/VIPMUSIC > project,
-# and is released under the "GNU v3.0 License Agreement".
-# Please see < https://github.com/KIRU-OP/VIPMUSIC/blob/master/LICENSE >
-#
-# All rights reserved.
 import asyncio
-import os
 import shlex
 from typing import Tuple
+
 from git import Repo
 from git.exc import GitCommandError, InvalidGitRepositoryError
+
 import config
+
 from ..logging import LOGGER
 
-# --- Loop Error Fix ---
-try:
-    loop = asyncio.get_event_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+loop = asyncio.get_event_loop_policy().get_event_loop()
 
 
 def install_req(cmd: str) -> Tuple[str, str, int, int]:
@@ -38,16 +27,11 @@ def install_req(cmd: str) -> Tuple[str, str, int, int]:
             process.returncode,
             process.pid,
         )
+
     return loop.run_until_complete(install_requirements())
 
 
 def git():
-    # --- FIX 1 ---
-    # Git ko kabhi bhi interactive username/password prompt terminal me
-    # dikhane se rokta hai. Auth fail hone par ye seedha exception dega,
-    # jise neeche wala except block pakad lega — bot hang nahi hoga.
-    os.environ["GIT_TERMINAL_PROMPT"] = "0"
-
     REPO_LINK = config.UPSTREAM_REPO
     if config.GIT_TOKEN:
         GIT_USERNAME = REPO_LINK.split("com/")[1].split("/")[0]
@@ -55,77 +39,37 @@ def git():
         UPSTREAM_REPO = f"https://{GIT_USERNAME}:{config.GIT_TOKEN}@{TEMP_REPO}"
     else:
         UPSTREAM_REPO = config.UPSTREAM_REPO
-
     try:
         repo = Repo()
-        LOGGER(__name__).info("Git Client Found.")
-    except (InvalidGitRepositoryError, GitCommandError):
+        LOGGER(__name__).info(f"Git Client Found [VPS DEPLOYER]")
+    except GitCommandError:
+        LOGGER(__name__).info(f"Invalid Git Command")
+    except InvalidGitRepositoryError:
         repo = Repo.init()
         if "origin" in repo.remotes:
             origin = repo.remote("origin")
         else:
             origin = repo.create_remote("origin", UPSTREAM_REPO)
         origin.fetch()
+        repo.create_head(
+            config.UPSTREAM_BRANCH,
+            origin.refs[config.UPSTREAM_BRANCH],
+        )
+        repo.heads[config.UPSTREAM_BRANCH].set_tracking_branch(
+            origin.refs[config.UPSTREAM_BRANCH]
+        )
+        repo.heads[config.UPSTREAM_BRANCH].checkout(True)
 
-        # ऑटोमैटिक ब्रांच डिटेक्शन
         try:
-            BRANCH = config.UPSTREAM_BRANCH
-            repo.create_head(BRANCH, origin.refs[BRANCH])
-        except Exception:
-            # अगर config वाली ब्रांच नहीं मिली, तो जो भी पहली ब्रांच मिले उसे पकड़ लो
-            BRANCH = origin.refs[0].remote_head
-            repo.create_head(BRANCH, origin.refs[BRANCH])
+            repo.create_remote("origin", config.UPSTREAM_REPO)
+        except BaseException:
+            pass
 
-        repo.heads[BRANCH].set_tracking_branch(origin.refs[BRANCH])
-        repo.heads[BRANCH].checkout(True)
-
+    nrs = repo.remote("origin")
+    nrs.fetch(config.UPSTREAM_BRANCH)
     try:
-        nrs = repo.remote("origin")
-        # --- FIX 2 ---
-        # Repo pehle se exist karti ho (naya clone na ho), tab bhi
-        # origin ka URL hamesha token wale UPSTREAM_REPO se update karo.
-        # Pehle ye sirf naye repo banate waqt set hota tha, isliye
-        # purani/private repo pe auth fail ho kar password maangta tha.
-        nrs.set_url(UPSTREAM_REPO)
-    except Exception:
-        nrs = repo.create_remote("origin", UPSTREAM_REPO)
-
-    try:
-        # यहाँ हम चेक कर रहे हैं कि रिमोट पर कौन सी ब्रांच है
-        nrs.fetch()
-
-        remote_branch_names = [
-            ref.remote_head for ref in nrs.refs
-        ]
-
-        active_branch = repo.active_branch.name
-        target_branch = None
-
-        # --- FIX 3 ---
-        # Pehle config.UPSTREAM_BRANCH try karo (agar set hai aur remote
-        # par exist karti hai), warna local active branch, warna remote
-        # ke default branch par fallback karo. Isse "couldn't find
-        # remote ref" error nahi aayega.
-        configured_branch = getattr(config, "UPSTREAM_BRANCH", None)
-        if configured_branch and configured_branch in remote_branch_names:
-            target_branch = configured_branch
-        elif active_branch in remote_branch_names:
-            target_branch = active_branch
-        elif remote_branch_names:
-            target_branch = remote_branch_names[0]
-
-        if target_branch is None:
-            raise Exception("No matching branch found on remote 'origin'")
-
-        if target_branch != active_branch:
-            LOGGER(__name__).info(
-                f"Local branch '{active_branch}' not found on remote, "
-                f"switching pull target to '{target_branch}'"
-            )
-
-        nrs.pull(target_branch)
-        LOGGER(__name__).info(f"Successfully updated from branch: {target_branch}")
-    except Exception as e:
-        LOGGER(__name__).error(f"Update skipped due to: {e}")
-
+        nrs.pull(config.UPSTREAM_BRANCH)
+    except GitCommandError:
+        repo.git.reset("--hard", "FETCH_HEAD")
     install_req("pip3 install --no-cache-dir -r requirements.txt")
+    LOGGER(__name__).info(f"Fetched Updates from: UPSTREAM_REPO")
