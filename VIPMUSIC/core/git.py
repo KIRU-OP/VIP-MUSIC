@@ -7,6 +7,7 @@
 #
 # All rights reserved.
 import asyncio
+import os
 import shlex
 from typing import Tuple
 from git import Repo
@@ -20,6 +21,7 @@ try:
 except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
 
 def install_req(cmd: str) -> Tuple[str, str, int, int]:
     async def install_requirements():
@@ -38,7 +40,14 @@ def install_req(cmd: str) -> Tuple[str, str, int, int]:
         )
     return loop.run_until_complete(install_requirements())
 
+
 def git():
+    # --- FIX 1 ---
+    # Git ko kabhi bhi interactive username/password prompt terminal me
+    # dikhane se rokta hai. Auth fail hone par ye seedha exception dega,
+    # jise neeche wala except block pakad lega — bot hang nahi hoga.
+    os.environ["GIT_TERMINAL_PROMPT"] = "0"
+
     REPO_LINK = config.UPSTREAM_REPO
     if config.GIT_TOKEN:
         GIT_USERNAME = REPO_LINK.split("com/")[1].split("/")[0]
@@ -49,7 +58,7 @@ def git():
 
     try:
         repo = Repo()
-        LOGGER(__name__).info(f"Git Client Found.")
+        LOGGER(__name__).info("Git Client Found.")
     except (InvalidGitRepositoryError, GitCommandError):
         repo = Repo.init()
         if "origin" in repo.remotes:
@@ -57,22 +66,28 @@ def git():
         else:
             origin = repo.create_remote("origin", UPSTREAM_REPO)
         origin.fetch()
-        
+
         # ऑटोमैटिक ब्रांच डिटेक्शन
         try:
             BRANCH = config.UPSTREAM_BRANCH
             repo.create_head(BRANCH, origin.refs[BRANCH])
-        except:
-            # अगर config वाली ब्रांच नहीं मिली, तो जो भी पहली ब्रांच मिले उसे पकड़ लो
+        except Exception:
+            # अगर config वाली ब्रांच नहीं मिली, तो जो भी पहली ब्रांच मिले उसे पकड़ लो
             BRANCH = origin.refs[0].remote_head
             repo.create_head(BRANCH, origin.refs[BRANCH])
-            
+
         repo.heads[BRANCH].set_tracking_branch(origin.refs[BRANCH])
         repo.heads[BRANCH].checkout(True)
 
     try:
         nrs = repo.remote("origin")
-    except:
+        # --- FIX 2 ---
+        # Repo pehle se exist karti ho (naya clone na ho), tab bhi
+        # origin ka URL hamesha token wale UPSTREAM_REPO se update karo.
+        # Pehle ye sirf naye repo banate waqt set hota tha, isliye
+        # purani/private repo pe auth fail ho kar password maangta tha.
+        nrs.set_url(UPSTREAM_REPO)
+    except Exception:
         nrs = repo.create_remote("origin", UPSTREAM_REPO)
 
     try:
