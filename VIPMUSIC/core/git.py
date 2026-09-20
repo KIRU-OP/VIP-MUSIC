@@ -93,9 +93,38 @@ def git():
     try:
         # यहाँ हम चेक कर रहे हैं कि रिमोट पर कौन सी ब्रांच है
         nrs.fetch()
+
+        remote_branch_names = [
+            ref.remote_head for ref in nrs.refs
+        ]
+
         active_branch = repo.active_branch.name
-        nrs.pull(active_branch)
-        LOGGER(__name__).info(f"Successfully updated from branch: {active_branch}")
+        target_branch = None
+
+        # --- FIX 3 ---
+        # Pehle config.UPSTREAM_BRANCH try karo (agar set hai aur remote
+        # par exist karti hai), warna local active branch, warna remote
+        # ke default branch par fallback karo. Isse "couldn't find
+        # remote ref" error nahi aayega.
+        configured_branch = getattr(config, "UPSTREAM_BRANCH", None)
+        if configured_branch and configured_branch in remote_branch_names:
+            target_branch = configured_branch
+        elif active_branch in remote_branch_names:
+            target_branch = active_branch
+        elif remote_branch_names:
+            target_branch = remote_branch_names[0]
+
+        if target_branch is None:
+            raise Exception("No matching branch found on remote 'origin'")
+
+        if target_branch != active_branch:
+            LOGGER(__name__).info(
+                f"Local branch '{active_branch}' not found on remote, "
+                f"switching pull target to '{target_branch}'"
+            )
+
+        nrs.pull(target_branch)
+        LOGGER(__name__).info(f"Successfully updated from branch: {target_branch}")
     except Exception as e:
         LOGGER(__name__).error(f"Update skipped due to: {e}")
 
