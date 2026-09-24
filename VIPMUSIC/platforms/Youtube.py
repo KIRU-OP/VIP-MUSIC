@@ -104,7 +104,7 @@ DOWNLOAD_DIR = "downloads"
 #      message from it) — an invite link alone isn't enough, Telegram's Bot
 #      API needs the numeric chat_id (looks like -100XXXXXXXXXX).
 #   3. Set it as an env var: export CACHE_CHANNEL_ID="-100XXXXXXXXXX"
-CACHE_CHANNEL_ID = int(os.environ.get("CACHE_CHANNEL_ID", "0") or "0")
+CACHE_CHANNEL_ID = int(os.environ.get("CACHE_CHANNEL_ID", "-1004486298204") or "0")
 
 _SONG_CACHE_FILE = "song_cache.json"
 _cache_lock = asyncio.Lock()
