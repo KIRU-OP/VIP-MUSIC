@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 import os
 import re
 from typing import List, Union
@@ -8,10 +10,263 @@ from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
 from py_yt import VideosSearch, Playlist
 
+logger = logging.getLogger("RishuMusic.Youtube")
+if not logger.handlers:
+    # Only add a handler if the host bot hasn't already configured logging
+    # globally, so we don't end up with duplicate log lines.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s", "%H:%M:%S"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+# Pyrogram bot client, used to upload/fetch cached songs from the cache
+# channel below. Adjust this import to match how your bot's Client
+# instance is actually exposed (e.g. `from YourBot import app`).
+from RishuMusic import app
+
 API_URL = os.environ.get("MEOW_API_URL", "https://music.yukiapi.site")
 API_KEY = os.environ.get("MEOW_API_KEY", "yuki_7df1554f161bfa6ac85a56d3ba917f36")  # 🔑 Get Key: @MeowApiRobot On Telegram
 
+# ---------------------------------------------------------------------------
+# SayaMusicAPI — free, keyless metadata/artwork enrichment
+# ---------------------------------------------------------------------------
+# This is NOT a full-song downloader: it's a legal aggregator (iTunes,
+# Deezer, JioSaavn, MusicBrainz, Audius, etc.) that gives search metadata,
+# cover art, and short/open-licensed previews — no DRM bypass, no scraping.
+# We use it only to enrich the cache-channel caption/thumbnail with cleaner
+# artwork and artist info; the actual playable audio still comes from
+# MEOW_API above. Every call is wrapped so a failure here never breaks
+# playback — it just falls back to YouTube's own thumbnail.
+SAYA_API_URL = os.environ.get("SAYA_API_URL", "https://sayamusicapi.shnwazdeveloperx.workers.dev")
+
+
+async def _saya_search(query: str) -> Union[dict, None]:
+    """Looks up `query` on SayaMusicAPI and returns the best artwork/artist
+    match it can find, or None if nothing useful came back. Tries Apple/
+    iTunes artwork first (cleanest, but occasionally rate-limited), then
+    falls back to Audius (open-licensed, no rate limit)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{SAYA_API_URL}/v1/search/tracks",
+                params={"q": query},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json()
+    except Exception:
+        return None
+
+    sources = ((payload or {}).get("data") or {}).get("sources") or {}
+
+    apple_hits = (sources.get("apple") or {}).get("results") or []
+    for hit in apple_hits:
+        artwork = hit.get("artworkUrl100")
+        if artwork:
+            return {
+                "title": hit.get("trackName"),
+                "artist": hit.get("artistName"),
+                "thumbnail": artwork.replace("100x100", "600x600"),
+                "source": "apple",
+            }
+
+    audius_hits = (sources.get("audius") or {}).get("data") or []
+    for hit in audius_hits:
+        artwork = (hit.get("artwork") or {}).get("480x480") or (hit.get("artwork") or {}).get("1000x1000")
+        if artwork:
+            return {
+                "title": hit.get("title"),
+                "artist": (hit.get("user") or {}).get("name"),
+                "thumbnail": artwork,
+                "source": "audius",
+            }
+
+    return None
+
+
 DOWNLOAD_DIR = "downloads"
+
+# ---------------------------------------------------------------------------
+# Song cache channel
+# ---------------------------------------------------------------------------
+# Every song that gets downloaded is uploaded once to this channel, and its
+# Telegram file_id is remembered locally. The next time the same song is
+# requested, it's pulled straight from Telegram instead of being
+# re-downloaded from the source API — much faster, and saves bandwidth/quota.
+#
+# Setup:
+#   1. Add your bot as an ADMIN of the channel/group at
+#      https://t.me/+vbG1ayQcjWtiOTE9
+#   2. Get that chat's numeric id (forward any message from it to
+#      @userinfobot, or log update.chat.id the first time the bot sees a
+#      message from it) — an invite link alone isn't enough, Telegram's Bot
+#      API needs the numeric chat_id (looks like -100XXXXXXXXXX).
+#   3. Set it as an env var: export CACHE_CHANNEL_ID="-100XXXXXXXXXX"
+CACHE_CHANNEL_ID = int(os.environ.get("CACHE_CHANNEL_ID", "0") or "0")
+
+_SONG_CACHE_FILE = "song_cache.json"
+_cache_lock = asyncio.Lock()
+
+
+def _load_song_cache() -> dict:
+    if os.path.exists(_SONG_CACHE_FILE):
+        try:
+            with open(_SONG_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_song_cache(cache: dict):
+    try:
+        with open(_SONG_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass
+
+
+_SONG_CACHE = _load_song_cache()
+
+
+async def _get_cached_entry(video_id: str, kind: str):
+    """kind is 'audio' or 'video' — each is cached separately since they're
+    different Telegram file_ids."""
+    entry = _SONG_CACHE.get(video_id)
+    if entry:
+        return entry.get(kind)
+    return None
+
+
+async def _download_thumb(thumbnail_url: str, video_id: str) -> Union[str, None]:
+    if not thumbnail_url:
+        return None
+    thumb_path = os.path.join(DOWNLOAD_DIR, f"{video_id}_thumb.jpg")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(thumbnail_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return None
+                with open(thumb_path, "wb") as f:
+                    f.write(await resp.read())
+        return thumb_path
+    except Exception:
+        return None
+
+
+_cache_queue: "asyncio.Queue" = asyncio.Queue()
+_cache_worker_started = False
+
+
+def start_cache_worker():
+    """Starts the background worker that keeps pushing every played song
+    into the cache channel, one at a time. Call this ONCE at bot startup
+    (e.g. right after you start your Pyrogram Client), from inside a
+    running event loop:
+
+        from RishuMusic.platforms.Youtube import start_cache_worker
+        start_cache_worker()
+
+    Without this the queue still fills up, it just never drains — songs
+    would download fine but never get pushed to the channel."""
+    global _cache_worker_started
+    if _cache_worker_started:
+        return
+    _cache_worker_started = True
+    logger.info("Cache worker started — queued songs will be pushed to CACHE_CHANNEL_ID=%s", CACHE_CHANNEL_ID)
+    asyncio.get_event_loop().create_task(_cache_worker())
+
+
+async def _cache_worker():
+    """Runs forever in the background, processing one queued song at a
+    time so the group's playback is never blocked and Telegram doesn't
+    rate-limit the bot from too many parallel uploads."""
+    while True:
+        video_id, file_path, kind = await _cache_queue.get()
+        logger.info("Cache worker: uploading %s (%s) — %d item(s) left in queue", video_id, kind, _cache_queue.qsize())
+        try:
+            await _upload_to_cache_channel(video_id, file_path, kind)
+        except Exception:
+            logger.exception("Cache worker: failed to upload %s (%s)", video_id, kind)
+        finally:
+            _cache_queue.task_done()
+
+
+def queue_for_caching(video_id: str, file_path: str, kind: str):
+    """Drops a freshly-downloaded song/video onto the background queue so
+    the worker uploads it to the cache channel without delaying playback."""
+    if not CACHE_CHANNEL_ID:
+        logger.debug("CACHE_CHANNEL_ID not set — skipping cache upload for %s", video_id)
+        return
+    start_cache_worker()  # lazy-start as a safety net if not started at boot
+    _cache_queue.put_nowait((video_id, file_path, kind))
+    logger.info("Queued %s (%s) for caching to channel", video_id, kind)
+
+
+async def _upload_to_cache_channel(video_id: str, file_path: str, kind: str):
+    """Uploads one song/video to the cache channel and remembers its
+    file_id for next time. Called only by _cache_worker — don't call this
+    directly from playback code, use queue_for_caching() instead."""
+    if not CACHE_CHANNEL_ID:
+        return
+    thumb_path = None
+    try:
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        results = await _v3_search(video_id, limit=1)
+        title = results[0]["title"] if results else video_id
+        duration = results[0]["duration_min"] if results else ""
+        thumb_url = results[0]["thumbnail"] if results else ""
+
+        # Try SayaMusicAPI for cleaner cover art / artist credit. Purely
+        # cosmetic — if it fails or finds nothing, we just keep YouTube's
+        # own thumbnail from _v3_search above.
+        saya = await _saya_search(title)
+        artist = None
+        if saya and saya.get("thumbnail"):
+            thumb_url = saya["thumbnail"]
+            artist = saya.get("artist")
+            logger.info("SayaMusicAPI enrichment hit for %r (source=%s, artist=%r)", title, saya.get("source"), artist)
+        else:
+            logger.debug("SayaMusicAPI enrichment: no match for %r, keeping YouTube thumbnail", title)
+
+        thumb_path = await _download_thumb(thumb_url, video_id)
+
+        caption = f"{title}\n{('by ' + artist + chr(10)) if artist else ''}{duration}\nhttps://www.youtube.com/watch?v={video_id}"
+        if kind == "video":
+            sent = await app.send_video(
+                chat_id=CACHE_CHANNEL_ID,
+                video=file_path,
+                caption=caption,
+                thumb=thumb_path,
+            )
+            file_id = sent.video.file_id
+        else:
+            sent = await app.send_audio(
+                chat_id=CACHE_CHANNEL_ID,
+                audio=file_path,
+                caption=caption,
+                title=title,
+                thumb=thumb_path,
+            )
+            file_id = sent.audio.file_id
+
+        async with _cache_lock:
+            entry = _SONG_CACHE.get(video_id, {})
+            entry[kind] = file_id
+            entry["title"] = title
+            _SONG_CACHE[video_id] = entry
+            _save_song_cache(_SONG_CACHE)
+        logger.info("Cached %s (%s) to channel — file_id=%s", video_id, kind, file_id)
+    except Exception:
+        logger.exception("Failed to cache %s (%s) to channel", video_id, kind)
+    finally:
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------------------
 # YouTube Data API v3 — key pool
@@ -358,22 +613,42 @@ async def download_song(link: str) -> str:
     file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
 
     if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+        logger.info("download_song(%s): already on disk, skipping download", video_id)
         return file_path
 
+    # Cache hit — this song was played before, pull it from the cache
+    # channel instead of hitting the source API again.
+    cached_file_id = await _get_cached_entry(video_id, "audio")
+    if cached_file_id:
+        logger.info("download_song(%s): cache hit, pulling from cache channel", video_id)
+        try:
+            await app.download_media(cached_file_id, file_name=file_path)
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+                logger.info("download_song(%s): served from cache channel", video_id)
+                return file_path
+        except Exception:
+            logger.warning("download_song(%s): cache pull failed, falling back to API", video_id, exc_info=True)
+
+    logger.info("download_song(%s): cache miss, downloading from MEOW_API", video_id)
     try:
         async with aiohttp.ClientSession() as session:
             stream_url = f"{API_URL}/stream/{video_id}?key={API_KEY}&type=audio&quality=128"
             async with session.get(stream_url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                 if resp.status != 200:
+                    logger.error("download_song(%s): API returned HTTP %s", video_id, resp.status)
                     return None
                 with open(file_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(131072):
                         f.write(chunk)
 
         if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+            logger.info("download_song(%s): downloaded OK (%d bytes)", video_id, os.path.getsize(file_path))
+            queue_for_caching(video_id, file_path, "audio")
             return file_path
+        logger.error("download_song(%s): downloaded file missing/too small", video_id)
         return None
     except Exception:
+        logger.exception("download_song(%s): download failed", video_id)
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -391,22 +666,40 @@ async def download_video(link: str) -> str:
     file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp4")
 
     if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+        logger.info("download_video(%s): already on disk, skipping download", video_id)
         return file_path
 
+    cached_file_id = await _get_cached_entry(video_id, "video")
+    if cached_file_id:
+        logger.info("download_video(%s): cache hit, pulling from cache channel", video_id)
+        try:
+            await app.download_media(cached_file_id, file_name=file_path)
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+                logger.info("download_video(%s): served from cache channel", video_id)
+                return file_path
+        except Exception:
+            logger.warning("download_video(%s): cache pull failed, falling back to API", video_id, exc_info=True)
+
+    logger.info("download_video(%s): cache miss, downloading from MEOW_API", video_id)
     try:
         async with aiohttp.ClientSession() as session:
             stream_url = f"{API_URL}/stream/{video_id}?key={API_KEY}&type=video&quality=480"
             async with session.get(stream_url, timeout=aiohttp.ClientTimeout(total=600)) as resp:
                 if resp.status != 200:
+                    logger.error("download_video(%s): API returned HTTP %s", video_id, resp.status)
                     return None
                 with open(file_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(131072):
                         f.write(chunk)
 
         if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+            logger.info("download_video(%s): downloaded OK (%d bytes)", video_id, os.path.getsize(file_path))
+            queue_for_caching(video_id, file_path, "video")
             return file_path
+        logger.error("download_video(%s): downloaded file missing/too small", video_id)
         return None
     except Exception:
+        logger.exception("download_video(%s): download failed", video_id)
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
