@@ -10,7 +10,7 @@ from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
 from py_yt import VideosSearch, Playlist
 
-logger = logging.getLogger("VIPMUSIC.Youtube")
+logger = logging.getLogger("RishuMusic.Youtube")
 if not logger.handlers:
     # Only add a handler if the host bot hasn't already configured logging
     # globally, so we don't end up with duplicate log lines.
@@ -23,7 +23,7 @@ if not logger.handlers:
 # Pyrogram bot client, used to upload/fetch cached songs from the cache
 # channel below. Adjust this import to match how your bot's Client
 # instance is actually exposed (e.g. `from YourBot import app`).
-from VIPMUSIC import app
+from RishuMusic import app
 
 API_URL = os.environ.get("MEOW_API_URL", "https://music.yukiapi.site")
 API_KEY = os.environ.get("MEOW_API_KEY", "yuki_7df1554f161bfa6ac85a56d3ba917f36")  # 🔑 Get Key: @MeowApiRobot On Telegram
@@ -54,9 +54,21 @@ async def _saya_search(query: str) -> Union[dict, None]:
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
                 if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(
+                        "SayaMusicAPI: HTTP %s for query %r — %s",
+                        resp.status, query, body[:200],
+                    )
                     return None
                 payload = await resp.json()
+    except asyncio.TimeoutError:
+        logger.warning("SayaMusicAPI: request timed out for query %r", query)
+        return None
+    except aiohttp.ClientConnectorError as e:
+        logger.warning("SayaMusicAPI: connection failed for query %r — %s", query, e)
+        return None
     except Exception:
+        logger.exception("SayaMusicAPI: unexpected error for query %r", query)
         return None
 
     sources = ((payload or {}).get("data") or {}).get("sources") or {}
@@ -104,7 +116,7 @@ DOWNLOAD_DIR = "downloads"
 #      message from it) — an invite link alone isn't enough, Telegram's Bot
 #      API needs the numeric chat_id (looks like -100XXXXXXXXXX).
 #   3. Set it as an env var: export CACHE_CHANNEL_ID="-100XXXXXXXXXX"
-CACHE_CHANNEL_ID = int(os.environ.get("CACHE_CHANNEL_ID", "-1004486298204") or "0")
+CACHE_CHANNEL_ID = int(os.environ.get("CACHE_CHANNEL_ID", "0") or "0")
 
 _SONG_CACHE_FILE = "song_cache.json"
 _cache_lock = asyncio.Lock()
