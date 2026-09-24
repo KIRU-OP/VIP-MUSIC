@@ -43,7 +43,7 @@ DEFAULT_SETTINGS = {"maintenance": False, "logger": False, "autoend": False}
 HEROKU_API_KEY = os.environ.get("HEROKU_API_KEY")
 HEROKU_APP_NAME = os.environ.get("HEROKU_APP_NAME")
 UPSTREAM_REPO = os.environ.get(
-    "UPSTREAM_REPO", "https://github.com/vishalpandeynkp1/VIPNOBITAMUSIC_REPO"
+    "UPSTREAM_REPO", "https://github.com/KIRU-OP/VIP-MUSIC"
 )
 UPSTREAM_BRANCH = os.environ.get("UPSTREAM_BRANCH", "master")
 
