@@ -10,7 +10,7 @@ from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
 from py_yt import VideosSearch, Playlist
 
-logger = logging.getLogger("VIPMUSIC.Youtube")
+logger = logging.getLogger("RishuMusic.Youtube")
 if not logger.handlers:
     # Only add a handler if the host bot hasn't already configured logging
     # globally, so we don't end up with duplicate log lines.
@@ -23,7 +23,7 @@ if not logger.handlers:
 # Pyrogram bot client, used to upload/fetch cached songs from the cache
 # channel below. Adjust this import to match how your bot's Client
 # instance is actually exposed (e.g. `from YourBot import app`).
-from VIPMUSIC import app
+from RishuMusic import app
 
 API_URL = os.environ.get("MEOW_API_URL", "https://music.yukiapi.site")
 API_KEY = os.environ.get("MEOW_API_KEY", "yuki_7df1554f161bfa6ac85a56d3ba917f36")  # 🔑 Get Key: @MeowApiRobot On Telegram
