@@ -1,0 +1,102 @@
+{
+  "name": "NOBITAMUSIC",
+  "description": "Telegram Group Calls streaming bot with some useful features, written in Python with Pyrogram and Py-Tgcalls. Supporting platforms like YouTube, Spotify, Resso, Apple Music, SoundCloud and M3U8 links.",
+  "logo": "https://graph.org/file/3e8a7f68d056f890838d7.png",
+  "keywords": [
+    "python3",
+    "telegram",
+    "bot",
+    "VIP",
+    "VIPMUSICBot",
+    "telegram-bot",
+    "pyrogram"
+  ],
+
+  "stack": "container",
+  "env": {
+    "API_ID": {
+      "description": "Get this value from https://my.telegram.org",
+      "value": "",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Get this value from https://my.telegram.org",
+      "value": "",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "A bot's token. Get it from @Botfather",
+      "value": "",
+      "required": true
+    },
+    "EXTRA_PLUGINS": {
+      "description": "If you want to load extra plugins along with music plugins, fill True. If you don't want to load extra plugins, fill False.",
+      "value": "True",
+      "required": false
+    },
+    "MONGO_DB_URI": {
+      "description": "Get a MongoDB URL from https://cloud.mongodb.com. You can leave it blank if you want — the bot will use VIP's database for you.",
+      "value": "",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "The user id(s) of the user(s) you would like to add as OWNER. Multiple values should be separated with a space.",
+      "value": "",
+      "required": true
+    },
+    "STRING_SESSION": {
+      "description": "A Pyrogram string session. One assistant is compulsory.",
+      "value": "",
+      "required": true
+    },
+    "HEROKU_API_KEY": {
+      "description": "Your Heroku account's API key",
+      "value": "",
+      "required": false
+    },
+    "HEROKU_APP_NAME": {
+      "description": "Your Heroku app/bot's name",
+      "value": "",
+      "required": false
+    },
+    "LOG_GROUP_ID": {
+      "description": "Your log group ID. Add your bot and promote it as an admin with full rights. Use only a group, not a channel ID.",
+      "value": "",
+      "required": true
+    },
+    "AUTO_GCAST": {
+      "description": "Fill here: On/Off — to turn auto gcast/broadcast messaging on or off.",
+      "value": "on",
+      "required": false
+    },
+    "AUTO_GCAST_MSG": {
+      "description": "Fill here the auto broadcast message which will be broadcast twice a day. Any type of message can be copied and pasted here.",
+      "value": "",
+      "required": false
+    },
+    "UPSTREAM_REPO": {
+      "description": "If you don't know this, leave as it is",
+      "value": "https://github.com/KIRU-OP/VIP-MUSIC",
+      "required": true
+    },
+    "UPSTREAM_BRANCH": {
+      "description": "Upstream repo's branch name",
+      "value": "master",
+      "required": true
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    },
+    {
+      "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
+    }
+  ],
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  }
+}
